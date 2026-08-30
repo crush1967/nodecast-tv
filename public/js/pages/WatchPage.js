@@ -44,6 +44,7 @@ class WatchPage {
         this.nextCancelBtn = document.getElementById('next-cancel');
 
         // Details section
+        this.detailsSection = document.getElementById('watch-details');
         this.posterEl = document.getElementById('watch-poster');
         this.contentTitleEl = document.getElementById('watch-content-title');
         this.yearEl = document.getElementById('watch-year');
@@ -171,6 +172,32 @@ class WatchPage {
             overflowMenu?.classList.add('hidden');
         });
 
+        // AirPlay - only Safari/WebKit exposes this API, so the button stays
+        // hidden everywhere else (same gating as Live TV's AirPlay button).
+        // This was simply never added when Live TV got it - not a
+        // regression, just an omission on this page until now.
+        const airplayBtn = document.getElementById('watch-airplay');
+        if (airplayBtn && typeof this.video.webkitShowPlaybackTargetPicker === 'function') {
+            airplayBtn.classList.remove('hidden');
+            airplayBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.video.webkitShowPlaybackTargetPicker();
+                overflowMenu?.classList.add('hidden');
+            });
+        }
+
+        // Stop - releases the transcode session/upstream connection. Needed
+        // as an explicit control because navigating away via the top nav
+        // (as opposed to the back arrow, which already calls goBack() ->
+        // stop()) deliberately keeps background playback running, with
+        // nothing else on screen to stop it from once you've left this page.
+        const stopBtn = document.getElementById('watch-stop-btn');
+        stopBtn?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            overflowMenu?.classList.add('hidden');
+            this.goBack();
+        });
+
         // Close overflow menu when clicking outside
         document.addEventListener('click', (e) => {
             if (overflowMenu && !overflowMenu.classList.contains('hidden') &&
@@ -253,7 +280,7 @@ class WatchPage {
         this.currentEpisode = content.currentEpisode || null;
         this.resumeTime = content.resumeTime || 0;
         this.containerExtension = content.containerExtension || 'mp4';
-        this.returnPage = content.type === 'movie' ? 'movies' : 'series';
+        this.returnPage = content.type === 'movie' ? 'movies' : (content.type === 'recording' ? 'recordings' : 'series');
 
         // Stop any Live TV playback before starting movie/series
         this.app?.player?.stop?.();
@@ -281,46 +308,52 @@ class WatchPage {
         // Populate details section
         this.renderDetails();
 
-        // Load recommended (movies) or episodes (series)
-        if (content.type === 'movie') {
+        // Load recommended (movies) or episodes (series) - a local recording has
+        // neither, and doesn't fit the shared favorites/history system (which
+        // expects a movie/series sourceId+id, not a local file), so skip all of
+        // that for it rather than force a mismatched shape through those calls.
+        // The whole details block (generic placeholder art, a duplicate Play
+        // button, a Favorite button that doesn't apply to a local file) is
+        // likewise VOD-only - hide it rather than show broken/meaningless UI.
+        if (content.type === 'recording') {
+            this.episodesSection?.classList.add('hidden');
+            this.recommendedSection?.classList.add('hidden');
+            this.detailsSection?.classList.add('hidden');
+        } else if (content.type === 'movie') {
+            this.detailsSection?.classList.remove('hidden');
             this.episodesSection?.classList.add('hidden');
             this.recommendedSection?.classList.remove('hidden');
             await this.loadRecommended(content.sourceId, content.categoryId);
         } else {
+            this.detailsSection?.classList.remove('hidden');
             this.recommendedSection?.classList.add('hidden');
             this.episodesSection?.classList.remove('hidden');
             this.renderEpisodes();
         }
 
-        // Check favorite status
-        await this.checkFavorite();
         // Show overlay initially
         this.showOverlay();
 
-        // Start watch history tracking
-        this.startHistoryTracking();
+        if (content.type !== 'recording') {
+            // Check favorite status
+            await this.checkFavorite();
+            // Start watch history tracking
+            this.startHistoryTracking();
+        }
     }
 
     /**
      * Show Now Playing indicator in navbar
      */
     showNowPlaying(title) {
-        const indicator = document.getElementById('now-playing-indicator');
-        const textEl = document.getElementById('now-playing-text');
-        if (indicator && textEl) {
-            textEl.textContent = title || 'Now Playing';
-            indicator.classList.remove('hidden');
-        }
+        this.app.setNowPlaying(title, 'watch', () => this.stop());
     }
 
     /**
      * Hide Now Playing indicator in navbar
      */
     hideNowPlaying() {
-        const indicator = document.getElementById('now-playing-indicator');
-        if (indicator) {
-            indicator.classList.add('hidden');
-        }
+        this.app.clearNowPlaying();
     }
 
     /**
@@ -344,8 +377,14 @@ class WatchPage {
             return session.playlistUrl;
         } catch (err) {
             console.error('[WatchPage] Session start failed:', err);
-            // Fallback to direct transcode if session fails
-            return `/api/transcode?url=${encodeURIComponent(url)}`;
+            // Previously fell back to `/api/transcode?url=...` here - that
+            // endpoint serves a raw MP4 stream, not an HLS playlist, and
+            // every caller passes this return value straight into
+            // hls.loadSource()/playHls(), which can never parse an MP4 as
+            // HLS (same bug fixed in VideoPlayer.js's version of this
+            // method - see its comment for the full explanation). Rethrowing
+            // lets callers decide how to actually recover.
+            throw err;
         }
     }
 
@@ -466,15 +505,25 @@ class WatchPage {
                     this.setVolumeFromStorage();
                     return;
                 } else if (info.needsRemux) {
-                    // Remux (container swap) currently doesn't use session logic, uses direct stream
-                    // TODO: Move remux to session logic if seeking is needed for TS files
-                    console.log('[WatchPage] Auto: Using remux (.ts container)');
+                    // The direct-to-MP4 remux endpoint (video.src = /api/remux?...) is a
+                    // single continuous stream with no Content-Length and an empty moov -
+                    // Safari's native <video> loader doesn't handle that shape reliably
+                    // (unlike Chrome/Firefox) and can abort the connection outright,
+                    // leaving playback stuck. Route through the same HLS transcode
+                    // session used above instead - it's plain stream-copy (no
+                    // re-encoding, same speed) but packages it as HLS/MPEG-TS, which is
+                    // Safari's native strongest suit and already proven working on iOS
+                    // for live channels.
+                    console.log('[WatchPage] Auto: Using HLS session (.ts container remux)');
                     this.updateTranscodeStatus('remuxing', 'Remux (Auto)');
-                    const finalUrl = `/api/remux?url=${encodeURIComponent(url)}`;
-                    this.video.src = finalUrl;
-                    this.video.play().catch(e => {
-                        if (e.name !== 'AbortError') console.error('[WatchPage] Autoplay error:', e);
+                    const playlistUrl = await this.startTranscodeSession(url, {
+                        videoMode: 'copy',
+                        seekOffset: this.resumeTime,
+                        videoCodec: info.video,
+                        audioCodec: info.audio,
+                        audioChannels: info.audioChannels
                     });
+                    this.playHls(playlistUrl);
                     this.setVolumeFromStorage();
                     return;
                 }
@@ -492,10 +541,17 @@ class WatchPage {
             const statusMode = settings.upscaleEnabled ? 'upscaling' : 'transcoding';
             console.log(`[WatchPage] ${statusText} enabled. Starting session (encode)...`);
             this.updateTranscodeStatus(statusMode, statusText);
-            const playlistUrl = await this.startTranscodeSession(url, {
-                videoMode: 'encode',
-                seekOffset: this.resumeTime
-            });
+            let playlistUrl;
+            try {
+                playlistUrl = await this.startTranscodeSession(url, {
+                    videoMode: 'encode',
+                    seekOffset: this.resumeTime
+                });
+            } catch (err) {
+                console.error('[WatchPage] Transcode session failed:', err);
+                this.updateTranscodeStatus('hidden');
+                return;
+            }
             this.playHls(playlistUrl);
             this.setVolumeFromStorage();
             return;
@@ -514,11 +570,18 @@ class WatchPage {
                 videoCodec = info.video;
             } catch (e) { console.warn('Probe failed for force audio, assuming h264'); }
 
-            const playlistUrl = await this.startTranscodeSession(url, {
-                videoMode: 'copy',
-                videoCodec,
-                seekOffset: this.resumeTime
-            });
+            let playlistUrl;
+            try {
+                playlistUrl = await this.startTranscodeSession(url, {
+                    videoMode: 'copy',
+                    videoCodec,
+                    seekOffset: this.resumeTime
+                });
+            } catch (err) {
+                console.error('[WatchPage] Transcode session failed:', err);
+                this.updateTranscodeStatus('hidden');
+                return;
+            }
             this.playHls(playlistUrl);
             this.setVolumeFromStorage();
             return;
@@ -528,7 +591,16 @@ class WatchPage {
         if (settings.forceRemux && isRawTs) {
             console.log('[WatchPage] Force Remux enabled');
             this.updateTranscodeStatus('remuxing', 'Remux (Force)');
-            const finalUrl = `/api/remux?url=${encodeURIComponent(url)}`;
+
+            let audioCodec = '';
+            try {
+                const ua = settings.userAgentPreset === 'custom' ? settings.userAgentCustom : settings.userAgentPreset;
+                const probeRes = await fetch(`/api/probe?url=${encodeURIComponent(url)}&ua=${encodeURIComponent(ua || '')}`);
+                const info = await probeRes.json();
+                audioCodec = info.audio || '';
+            } catch (e) { console.warn('Probe failed for force remux, assuming non-AAC'); }
+
+            const finalUrl = `/api/remux?url=${encodeURIComponent(url)}&audioCodec=${encodeURIComponent(audioCodec)}`;
             this.video.src = finalUrl;
             this.video.play().catch(e => {
                 if (e.name !== 'AbortError') console.error('[WatchPage] Autoplay error:', e);
@@ -537,9 +609,28 @@ class WatchPage {
             return;
         }
 
-        // Determine if proxy is needed
+        // Native Safari/iOS HLS playback (see playHls()'s comment for why this
+        // matters for AirPlay) also needs the proxy unconditionally, same
+        // reasoning as Live TV: this provider's live playlist URL redirects to
+        // a short-lived, token-bearing CDN URL that native reload polls
+        // directly instead of re-resolving, and iOS's native player prefetches
+        // segments more aggressively in parallel than HLS.js, tripping this
+        // provider's concurrency limit (see upstreamSemaphore in proxy.js).
+        // Both look identical to "loads the first frame, then freezes."
+        const isSafariNative = typeof this.video.webkitShowPlaybackTargetPicker === 'function' &&
+            (this.video.canPlayType('application/vnd.apple.mpegurl') === 'probably' ||
+                this.video.canPlayType('application/vnd.apple.mpegurl') === 'maybe');
+
+        // Determine if proxy is needed. Mixed content: this page may be HTTPS
+        // while the stream is HTTP-only (true of most IPTV providers) - left
+        // to react to it instead, the browser silently blocks the direct
+        // fetch before it even reaches the network, and only a later retry
+        // catches it. Deciding this upfront avoids that doomed first attempt,
+        // same fix already applied to Live TV.
         const proxyRequiredDomains = ['pluto.tv'];
-        const needsProxy = settings.forceProxy || proxyRequiredDomains.some(domain => url.includes(domain));
+        const isMixedContent = window.location.protocol === 'https:' && url.startsWith('http://');
+        const needsProxy = settings.forceProxy || isMixedContent || isSafariNative ||
+            proxyRequiredDomains.some(domain => url.includes(domain));
         const finalUrl = needsProxy ? `/api/proxy/stream?url=${encodeURIComponent(url)}` : url;
 
         console.log('[WatchPage] Playing:', { url, needsProxy, looksLikeHls });
@@ -561,12 +652,55 @@ class WatchPage {
     }
 
     /**
-     * Play HLS stream using Hls.js
+     * Play HLS stream - native Safari/iOS when available (see the AirPlay
+     * button comment above: a MediaSource-backed <video> has no independent
+     * URL for AirPlay's receiver to fetch and decode on its own, so AirPlay
+     * falls back to audio-only when routed through HLS.js), HLS.js otherwise.
+     *
+     * Native playback of our own locally-generated transcode/remux output was
+     * once observed to freeze on iOS after the first frame instead of polling
+     * for new segments. On investigation that matches what happens when the
+     * FFmpeg session feeding the playlist silently dies upstream (this
+     * provider's live source redirects to a short-lived, token-bearing CDN
+     * URL - see the matching comment on the session's own input handling in
+     * transcodeSession.js), not a native-HLS-specific bug: the last segment
+     * plays out and there's nothing new to fetch. Now that FFmpeg's input is
+     * proxied to survive that, native playback is worth trying again -
+     * startNativeStallWatch() backs it up with an automatic fallback to
+     * HLS.js if a stall happens anyway, so this is strictly an improvement.
      */
     playHls(url) {
+        this.clearNativeStallWatch();
         if (this.hls) {
             this.hls.destroy();
+            this.hls = null;
         }
+
+        if (typeof this.video.webkitShowPlaybackTargetPicker === 'function' &&
+            (this.video.canPlayType('application/vnd.apple.mpegurl') === 'probably' ||
+                this.video.canPlayType('application/vnd.apple.mpegurl') === 'maybe')) {
+            this.video.src = url;
+            this.video.play().catch(e => {
+                if (e.name !== 'AbortError') console.error('[WatchPage] Autoplay error:', e);
+            });
+            this.startNativeStallWatch(url, () => this.playHlsJs(url));
+            return;
+        }
+
+        this.playHlsJs(url);
+    }
+
+    /**
+     * HLS.js playback - the always-works fallback playHls() uses on
+     * non-Safari browsers, or automatically if native playback above stalls.
+     */
+    playHlsJs(url) {
+        this.clearNativeStallWatch();
+        if (this.hls) {
+            this.hls.destroy();
+            this.hls = null;
+        }
+        this.video.src = '';
 
         this.hls = new Hls({
             maxBufferLength: 30,
@@ -602,12 +736,56 @@ class WatchPage {
                 // Note: Transcoded streams are local, so no CORS issues usually
                 if (!url.startsWith('/api/') && (data.type === Hls.ErrorTypes.NETWORK_ERROR)) {
                     console.log('[WatchPage] Retrying via proxy...');
-                    this.playHls(`/api/proxy/stream?url=${encodeURIComponent(this.currentUrl)}`);
+                    this.playHlsJs(`/api/proxy/stream?url=${encodeURIComponent(this.currentUrl)}`);
                 } else {
                     this.hls.destroy();
                 }
             }
         });
+    }
+
+    /**
+     * Watches native <video> HLS playback for the specific "loads the first
+     * frame and never advances" stall (see playHls()'s comment for the two
+     * known causes) and calls onStall() once if it's detected, so playback
+     * recovers via HLS.js instead of sitting frozen indefinitely. No-ops once
+     * a newer call to startNativeStallWatch/clearNativeStallWatch supersedes
+     * this one (content change, stop, or the HLS.js fallback itself starting).
+     */
+    startNativeStallWatch(url, onStall) {
+        this.clearNativeStallWatch();
+        this._nativeStallUrl = url;
+        let lastTime = -1;
+        let stuckStreak = 0;
+        this._nativeStallInterval = setInterval(() => {
+            if (this._nativeStallUrl !== url) {
+                this.clearNativeStallWatch();
+                return;
+            }
+            if (this.video.paused || this.video.seeking) return;
+            if (this.video.currentTime === lastTime) {
+                stuckStreak++;
+            } else {
+                stuckStreak = 0;
+                lastTime = this.video.currentTime;
+            }
+            // ~9s (3 checks) of zero progress while "playing" - long enough to
+            // not false-positive on normal buffering, short enough that the
+            // fallback still feels responsive.
+            if (stuckStreak >= 3) {
+                console.warn('[WatchPage] Native HLS stalled, falling back to HLS.js:', url);
+                this.clearNativeStallWatch();
+                onStall();
+            }
+        }, 3000);
+    }
+
+    clearNativeStallWatch() {
+        if (this._nativeStallInterval) {
+            clearInterval(this._nativeStallInterval);
+            this._nativeStallInterval = null;
+        }
+        this._nativeStallUrl = null;
     }
 
     setVolumeFromStorage() {
@@ -635,6 +813,7 @@ class WatchPage {
             this.hls.destroy();
             this.hls = null;
         }
+        this.clearNativeStallWatch();
         if (this.video) {
             this.video.pause();
             this.video.src = '';
@@ -885,6 +1064,15 @@ class WatchPage {
 
     hideLoading() {
         this.loadingSpinner?.classList.remove('show');
+        // canplay fires once there's decodable data regardless of whether a
+        // play() call actually succeeded - if autoplay got silently rejected
+        // (e.g. iOS after the async delay of starting a transcode session),
+        // the video never actually transitions state, so neither 'play' nor
+        // 'pause' fires and onPause() (which is what shows the center play
+        // button) never runs. Checking directly here is the one place
+        // guaranteed to catch that and give the user a way to manually
+        // resume instead of a frozen, unrecoverable video.
+        if (this.video?.paused) this.onPause();
     }
 
     // === Captions ===

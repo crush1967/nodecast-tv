@@ -16,6 +16,50 @@ const { Readable } = require('stream');
 // Default cache max age in hours
 const DEFAULT_MAX_AGE_HOURS = 24;
 
+// Short-TTL cache for proxied HLS manifests. Live providers hand out a
+// fresh, short-lived session token on every request to the top-level
+// playlist URL - polling that URL on every HLS reload (ffmpeg's input
+// reload and the client's hls.js reload can both land within the same
+// couple of seconds) was causing the provider to invalidate the in-flight
+// token, killing playback after just a couple of segments. Reusing the
+// already-resolved manifest within this window avoids requesting a new
+// token more often than the stream actually needs.
+const manifestCache = new Map();
+const MANIFEST_CACHE_TTL_MS = 2000;
+
+// Limits how many upstream requests to the provider we have in flight at
+// once. Confirmed empirically: firing more than a handful of simultaneous
+// segment requests at this provider causes the excess ones to hang for
+// 60-90+ seconds before eventually failing, rather than queueing or
+// rejecting promptly. iOS's native HLS player prefetches segments far more
+// aggressively/in-parallel than HLS.js (which we've tuned to be
+// conservative), routinely tripping this - from the player's side, a
+// request stuck behind that wall looks identical to "never loads,"
+// explaining live playback spinning forever specifically on native Safari.
+// Queueing our own requests here keeps us under that threshold instead of
+// finding out about it 87 seconds later.
+class Semaphore {
+    constructor(max) {
+        this.max = max;
+        this.active = 0;
+        this.queue = [];
+    }
+    async acquire() {
+        if (this.active < this.max) {
+            this.active++;
+            return;
+        }
+        await new Promise(resolve => this.queue.push(resolve));
+        this.active++;
+    }
+    release() {
+        this.active--;
+        const next = this.queue.shift();
+        if (next) next();
+    }
+}
+const upstreamSemaphore = new Semaphore(4);
+
 // Helper to get formatted category list from DB
 function getCategoriesFromDb(sourceId, type, includeHidden = false) {
     const db = getDb();
@@ -600,6 +644,19 @@ router.post('/epg/:sourceId/channels', async (req, res) => {
 router.get('/stream', async (req, res) => {
     const maxRetries = 2;
     let lastError = null;
+    let responseStarted = false;
+
+    // Serve a still-fresh manifest without touching the upstream at all, so
+    // near-simultaneous reloads (ffmpeg + hls.js) share one resolved token.
+    // Range requests bypass this - they're for binary segments/seeking, not manifests.
+    if (!req.get('range')) {
+        const cached = manifestCache.get(req.query.url);
+        if (cached && (Date.now() - cached.timestamp) < MANIFEST_CACHE_TTL_MS) {
+            res.set('Content-Type', 'application/vnd.apple.mpegurl');
+            res.set('Access-Control-Allow-Origin', '*');
+            return res.send(cached.body);
+        }
+    }
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
@@ -607,6 +664,17 @@ router.get('/stream', async (req, res) => {
             if (!url) {
                 return res.status(400).json({ error: 'URL required' });
             }
+
+            await upstreamSemaphore.acquire();
+            let semaphoreReleased = false;
+            const releaseSemaphore = () => {
+                if (!semaphoreReleased) {
+                    semaphoreReleased = true;
+                    upstreamSemaphore.release();
+                }
+            };
+
+            try {
 
             // Forward some headers to be more "transparent" back to the origin
             // Pluto TV uses multiple domains for content delivery
@@ -737,31 +805,54 @@ router.get('/stream', async (req, res) => {
                     } catch (e) { return line; }
                 }).join('\n');
 
+                manifestCache.set(req.query.url, { body: manifest, timestamp: Date.now() });
                 return res.send(manifest);
             }
 
-            // Binary content (Video Segment or Key): Collect and send
+            // Binary content (Video Segment or Key): stream straight through as it
+            // arrives instead of buffering the whole thing first - for multi-MB
+            // live video segments, waiting to collect the full body before sending
+            // anything adds real, avoidable latency on top of every segment fetch.
+            // Content-Length/Content-Range/Accept-Ranges were already forwarded
+            // above from the upstream response headers when present.
             console.log(`[Proxy] Serving binary content (${contentType})`);
             res.set('Content-Type', contentType || 'application/octet-stream');
 
-            // For small files (like encryption keys), collect all data and send at once
-            // This ensures proper Content-Length and response completion
-            const chunks = [firstChunk];
+            // Once we've written a byte, this response is committed - if the
+            // upstream connection drops partway through a segment (which this
+            // provider does often), the outer catch below must NOT retry via a
+            // fresh fetch(): that would call res.set()/res.write() again on a
+            // response that already has bytes in flight, splicing a second,
+            // unrelated response into the one the client already started
+            // receiving. That corruption is exactly what was showing up as
+            // repeated FFmpeg "connection reset" (-10053) failures - not the
+            // provider being flaky, but us silently mangling an in-flight
+            // response. Past this point, any failure just ends the response
+            // as-is; the actual client (FFmpeg/hls.js) has its own reconnect
+            // logic and will issue a clean, fresh request for what it's
+            // missing rather than receiving a corrupted one from us.
+            responseStarted = true;
+            res.write(firstChunk);
             let result = await iterator.next();
             while (!result.done) {
-                chunks.push(Buffer.from(result.value));
+                res.write(Buffer.from(result.value));
                 result = await iterator.next();
             }
-            const fullContent = Buffer.concat(chunks);
-
-            // Set Content-Length for proper client handling
-            res.set('Content-Length', fullContent.length);
-            res.send(fullContent);
+            res.end();
             return; // Success - exit the retry loop
+
+            } finally {
+                releaseSemaphore();
+            }
 
         } catch (err) {
             lastError = err;
             console.error(`Stream proxy error (attempt ${attempt}/${maxRetries}):`, err.message);
+            if (responseStarted) {
+                console.log('[Proxy] Error after response already started - ending as-is, not retrying');
+                if (!res.writableEnded) res.end();
+                return;
+            }
             if (attempt < maxRetries) {
                 console.log('[Proxy] Retrying after error...');
                 await new Promise(r => setTimeout(r, 500));

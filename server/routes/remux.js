@@ -14,7 +14,7 @@ const db = require('../db');
  * Note: This does NOT fix Dolby/AC3 audio issues - use /api/transcode for that.
  */
 router.get('/', async (req, res) => {
-    const { url } = req.query;
+    const { url, audioCodec } = req.query;
     if (!url) {
         return res.status(400).json({ error: 'URL parameter is required' });
     }
@@ -61,9 +61,12 @@ router.get('/', async (req, res) => {
         '-c', 'copy',
         // Ensure extradata is correctly extracted/converted (fixes Annex B -> AVCC issues in Firefox)
         '-bsf:v', 'dump_extra',
-        // NOTE: We intentionally do NOT use -bsf:a aac_adtstoasc here
-        // That filter only works for AAC audio and breaks AC3/EAC3/MP3.
-        // If AAC audio from MPEG-TS fails in MP4, use /api/transcode instead.
+        // aac_adtstoasc converts ADTS-framed AAC (how MPEG-TS carries it) to the
+        // length-prefixed form MP4 requires - without it, muxing AAC into MP4
+        // fails outright ("Malformed AAC bitstream"). Only applied when the
+        // caller told us the audio is AAC (via probe) - the filter breaks
+        // AC3/EAC3/MP3, which is why it isn't unconditional.
+        ...(audioCodec && audioCodec.toLowerCase().includes('aac') ? ['-bsf:a', 'aac_adtstoasc'] : []),
         // Handle timestamp discontinuities at output
         '-fps_mode', 'passthrough',
         '-max_muxing_queue_size', '1024',
@@ -86,6 +89,15 @@ router.get('/', async (req, res) => {
     // Set headers for fragmented MP4
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Access-Control-Allow-Origin', '*');
+    // This is a single continuous FFmpeg pipe of unknown total length - it
+    // can't seek. Without an explicit Accept-Ranges, Safari's <video> loader
+    // probes with a Range request and, getting a plain 200 back instead of
+    // the 206 it asked for, can abort the connection outright rather than
+    // falling back to a normal sequential fetch (matches the "client
+    // disconnected" almost immediately after starting FFmpeg, before any
+    // real data had a chance to flow). Declaring "none" up front heads off
+    // that probe entirely.
+    res.setHeader('Accept-Ranges', 'none');
 
     // Pipe stdout to response
     ffmpeg.stdout.pipe(res);

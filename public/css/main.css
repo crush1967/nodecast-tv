@@ -59,16 +59,25 @@
   --transition-normal: 250ms ease;
   --transition-slow: 350ms ease;
 
-  /* Layout */
-  --navbar-height: 60px;
-  --sidebar-width: 320px;
-  --epg-sidebar-width: 250px;
-
   /* Safe area insets for notched devices */
   --safe-area-inset-top: env(safe-area-inset-top, 0px);
   --safe-area-inset-right: env(safe-area-inset-right, 0px);
   --safe-area-inset-bottom: env(safe-area-inset-bottom, 0px);
   --safe-area-inset-left: env(safe-area-inset-left, 0px);
+
+  /* Layout */
+  /* safe-area-inset-top is 0 in a normal Safari tab (Safari's own chrome
+     already reserves that space) but non-zero when launched from an iOS
+     home-screen icon (apple-mobile-web-app-status-bar-style: black-translucent
+     means the app owns the full screen, including under the status bar) -
+     without folding it in here, the navbar renders partly behind the status
+     bar in that mode and its top items (including the hamburger menu) become
+     covered and untappable. Every other rule already computes off this
+     variable rather than a hardcoded 60px, so redefining it here alone fixes
+     layout everywhere consistently. */
+  --navbar-height: calc(60px + var(--safe-area-inset-top));
+  --sidebar-width: 320px;
+  --epg-sidebar-width: 250px;
 }
 
 /* Reset & Base */
@@ -117,11 +126,17 @@ body {
   display: flex;
   flex-direction: column;
   height: 100vh;
-  /* fallback */
+  /* fallback for older browsers / before JS runs */
   height: 100dvh;
   /* dynamic viewport height for modern browsers */
-  height: -webkit-fill-available;
-  /* iOS Safari fallback */
+  height: calc(var(--vh, 1vh) * 100);
+  /* -webkit-fill-available misbehaves in nested flex layouts on iOS Safari
+     (can report a height taller than the visible viewport, which is what was
+     silently breaking scrolling on pages like Recordings - content technically
+     "fit" inside the oversized #app, so no scrollbar ever appeared). --vh is
+     the same JS-maintained custom property VideoPlayer.js already keeps in
+     sync with the real viewport (including toolbar collapse/rotation) for its
+     own container - reuse it here instead of the buggy fallback. */
 }
 
 /* Typography */
@@ -165,6 +180,7 @@ h4 {
   justify-content: space-between;
   height: var(--navbar-height);
   padding: 0 var(--space-lg);
+  padding-top: var(--safe-area-inset-top);
   padding-left: max(var(--space-lg), var(--safe-area-inset-left));
   padding-right: max(var(--space-lg), var(--safe-area-inset-right));
   background: var(--glass-bg);
@@ -406,18 +422,26 @@ h4 {
   }
 }
 
-/* Collapsed sidebar state (desktop only) */
-.channel-sidebar.collapsed {
-  width: 0;
-  min-width: 0;
-  overflow: hidden;
-  border-right: none;
-}
+/* Collapsed sidebar state (desktop only) - explicitly scoped to the desktop
+   breakpoint, not just labeled as such in a comment. Below 768px this same
+   #channel-sidebar element is repurposed as a slide-out drawer toggled by
+   .active instead, and a collapse preference persisted in localStorage from
+   an earlier desktop visit was zeroing the drawer's width even on mobile
+   (both classes end up on the element at once), making the "Channels"
+   button on mobile appear to do nothing. */
+@media (min-width: 769px) {
+  .channel-sidebar.collapsed {
+    width: 0;
+    min-width: 0;
+    overflow: hidden;
+    border-right: none;
+  }
 
-.channel-sidebar.collapsed .sidebar-header,
-.channel-sidebar.collapsed .channel-list {
-  opacity: 0;
-  visibility: hidden;
+  .channel-sidebar.collapsed .sidebar-header,
+  .channel-sidebar.collapsed .channel-list {
+    opacity: 0;
+    visibility: hidden;
+  }
 }
 
 /* Expand button when sidebar is collapsed */
@@ -693,6 +717,13 @@ h4 {
   right: 0;
   bottom: calc(env(safe-area-inset-bottom, 0px) + var(--ios-ui-bottom, 0px));
   box-sizing: border-box;
+  /* Higher than .now-playing-overlay's z-index: 50 - without this, the
+     channel-info/Up Next card that pops up after a channel or quality
+     change sits on top of the control bar (play/pause, volume, the "⋮"
+     menu) with no explicit stacking priority to keep it accessible, making
+     the controls genuinely unclickable - not just visually crowded - until
+     the card auto-hides on its own. */
+  z-index: 60;
 }
 
 /* Favorites */
@@ -1973,7 +2004,7 @@ kbd {
 
   /* Tablet/Mobile landscape */
   :root {
-    --navbar-height: 56px;
+    --navbar-height: calc(56px + var(--safe-area-inset-top));
     --sidebar-width: 320px;
     --space-lg: 16px;
     --space-xl: 24px;
@@ -1983,6 +2014,7 @@ kbd {
   /* Navigation - Hide text labels, show only icons */
   .navbar {
     padding: 0 var(--space-md);
+    padding-top: var(--safe-area-inset-top);
   }
 
   .navbar-menu {
@@ -2228,7 +2260,7 @@ kbd {
 
   /* Mobile portrait - phones */
   :root {
-    --navbar-height: 52px;
+    --navbar-height: calc(52px + var(--safe-area-inset-top));
     --space-md: 12px;
     --space-lg: 16px;
     --space-xl: 20px;
@@ -2241,7 +2273,8 @@ kbd {
   /* Navigation - Compact with hamburger menu */
   .navbar {
     padding: 0 var(--space-sm);
-    height: 52px;
+    padding-top: var(--safe-area-inset-top);
+    height: var(--navbar-height);
   }
 
   .logo {
@@ -2260,7 +2293,7 @@ kbd {
   /* Mobile dropdown menu */
   .navbar-menu {
     position: fixed;
-    top: 52px;
+    top: var(--navbar-height);
     left: 0;
     right: 0;
     flex-direction: column;
@@ -2640,11 +2673,11 @@ kbd {
 
   /* Extra small phones */
   :root {
-    --navbar-height: 48px;
+    --navbar-height: calc(48px + var(--safe-area-inset-top));
   }
 
   .navbar {
-    height: 48px;
+    height: var(--navbar-height);
   }
 
   .brand-text {
@@ -4143,6 +4176,11 @@ kbd {
   background: var(--color-bg-hover);
 }
 
+.overflow-menu-item.active {
+  color: var(--color-accent);
+  background: var(--color-accent-dim);
+}
+
 .overflow-menu-item .icon {
   width: 18px;
   height: 18px;
@@ -4445,19 +4483,15 @@ kbd {
 .now-playing-indicator {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 14px;
+  gap: 2px;
+  padding: 4px;
   margin-right: var(--space-md);
   background: linear-gradient(135deg, var(--color-accent) 0%, #8b5cf6 100%);
   border-radius: var(--radius-full);
   color: white;
-  text-decoration: none;
   font-size: 13px;
   font-weight: 500;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 200px;
+  max-width: 220px;
   box-shadow: 0 2px 8px rgba(99, 102, 241, 0.4);
   transition: transform var(--transition-fast), box-shadow var(--transition-fast);
   animation: now-playing-pulse 2s ease-in-out infinite;
@@ -4472,13 +4506,51 @@ kbd {
   display: none;
 }
 
+.now-playing-link {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 6px 2px 10px;
+  color: white;
+  text-decoration: none;
+  white-space: nowrap;
+  overflow: hidden;
+  min-width: 0;
+}
+
 .now-playing-icon {
   font-size: 10px;
+  flex-shrink: 0;
 }
 
 .now-playing-text {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.now-playing-stop {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.2);
+  color: rgba(255, 255, 255, 0.9);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.now-playing-stop svg {
+  width: 12px;
+  height: 12px;
+}
+
+.now-playing-stop:hover {
+  background: rgba(0, 0, 0, 0.4);
+  color: #fff;
 }
 
 @keyframes now-playing-pulse {
@@ -4499,10 +4571,16 @@ kbd {
     width: calc(100% - 32px);
     max-width: none;
     margin: 0 16px var(--space-sm) 16px;
-    padding: 10px 16px;
+    padding: 4px;
     font-size: 13px;
     border-radius: var(--radius-md);
     justify-content: center;
+  }
+
+  .now-playing-link {
+    flex: 1;
+    justify-content: center;
+    padding: 8px 6px 8px 10px;
   }
 }
 
@@ -4511,6 +4589,11 @@ kbd {
    ===================================================== */
 
 #page-home {
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+#page-recordings {
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
 }
@@ -4622,6 +4705,7 @@ kbd {
 }
 
 .dashboard-card {
+  position: relative;
   flex: 0 0 calc(50% - 10px);
   /* 2 per view on small screens */
   max-width: 240px;
@@ -4632,6 +4716,36 @@ kbd {
   transition: transform var(--transition-fast), box-shadow var(--transition-fast);
   scroll-snap-align: start;
   border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* Always visible (not hover-only) - this app is primarily used on touch
+   devices, which have no hover state to reveal a hidden button. */
+.card-remove-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 5;
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.6);
+  border: none;
+  border-radius: 50%;
+  color: rgba(255, 255, 255, 0.85);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.card-remove-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.card-remove-btn:hover {
+  background: var(--color-error, #e5484d);
+  color: #fff;
 }
 
 /* 4 per view on medium screens */
@@ -4763,6 +4877,37 @@ kbd {
   background: rgba(255, 255, 255, 0.05);
 }
 
+/* Always visible, not hover-only - same reasoning as .card-remove-btn above. */
+.tile-reorder {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+
+.tile-reorder-btn {
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.08);
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--color-text-muted);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.tile-reorder-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.tile-reorder-btn:hover {
+  background: var(--color-accent-dim);
+  color: var(--color-accent);
+}
+
 .tile-logo {
   width: 64px;
   height: 64px;
@@ -4818,5 +4963,423 @@ kbd {
   .tile-name {
     font-size: 0.7rem;
     max-width: 70px;
+  }
+}
+
+/* =====================================================
+   Recording Badge (player overlay)
+   ===================================================== */
+.recording-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(239, 68, 68, 0.85);
+  color: white;
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.recording-badge.hidden {
+  display: none;
+}
+
+.recording-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-full);
+  background: white;
+  animation: recording-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes recording-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+#btn-record .icon {
+  color: var(--color-error);
+}
+
+.record-duration-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md) var(--space-md);
+}
+
+.record-duration-panel.hidden {
+  display: none;
+}
+
+.record-duration-panel input {
+  background: var(--color-bg-primary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-primary);
+  padding: var(--space-sm);
+  font-size: 0.85rem;
+  width: 100%;
+}
+
+.record-start-btn {
+  justify-content: center;
+  background: var(--color-error);
+  color: white;
+}
+
+.record-start-btn:hover {
+  background: #dc2626;
+}
+
+/* =====================================================
+   Recordings Page
+   ===================================================== */
+.recordings-header {
+  padding: var(--space-xl) var(--space-xl) var(--space-md);
+}
+
+.recordings-header h2 {
+  margin: 0;
+  color: var(--color-text-primary);
+  font-size: 1.5rem;
+}
+
+/* --- Schedule panel: an elevated card, visually distinct from the lists below --- */
+.schedule-panel {
+  margin: 0 var(--space-xl) var(--space-xl);
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  padding: var(--space-lg);
+}
+
+.panel-title {
+  margin: 0 0 var(--space-lg);
+  color: var(--color-text-primary);
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.schedule-form {
+  display: grid;
+  grid-template-columns: 1.3fr 1fr 1fr auto;
+  align-items: end;
+  gap: var(--space-lg);
+}
+
+.schedule-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  min-width: 0;
+  /* Belt-and-suspenders for the datetime-local WebKit bug below: even with
+     min-width:0 and max-width:100% on the input itself, iOS Safari can still
+     paint the control's internal segments wider than the box it was given.
+     Clipping the field itself guarantees nothing spills past the card edge,
+     even though it means the rightmost segment can get cropped on very
+     narrow phones - tapping still opens the full native picker either way. */
+  overflow: hidden;
+}
+
+.schedule-field label {
+  color: var(--color-text-secondary);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.schedule-form select,
+.schedule-form input[type="datetime-local"] {
+  background: var(--color-bg-primary);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-primary);
+  padding: 10px 12px;
+  font-size: 0.9rem;
+  width: 100%;
+  /* Safari renders datetime-local's mm/dd/yyyy hh:mm segments at a fixed
+     intrinsic width and ignores width:100% on a narrow container unless
+     min-width is explicitly zeroed - without this it spills past the
+     panel edge on iPhone-width screens instead of shrinking to fit. */
+  min-width: 0;
+  max-width: 100%;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.schedule-form select:hover,
+.schedule-form input[type="datetime-local"]:hover {
+  border-color: var(--color-accent);
+}
+
+.schedule-form select:focus,
+.schedule-form input[type="datetime-local"]:focus {
+  outline: none;
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px var(--color-accent-dim);
+}
+
+/* Native calendar/clock icon defaults to near-black, invisible on a dark
+   background - invert it so it actually reads as part of the theme. */
+.schedule-form input[type="datetime-local"]::-webkit-calendar-picker-indicator {
+  filter: invert(0.85);
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 2px;
+}
+
+.schedule-form input[type="datetime-local"]::-webkit-calendar-picker-indicator:hover {
+  background: var(--color-bg-hover);
+}
+
+.schedule-quick-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: var(--space-lg);
+  padding-top: var(--space-md);
+  border-top: 1px solid var(--color-border);
+}
+
+.schedule-quick-label {
+  color: var(--color-text-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-right: 4px;
+}
+
+.schedule-quick-divider {
+  width: 1px;
+  height: 18px;
+  background: var(--color-border);
+  margin: 0 2px;
+}
+
+.btn-quick {
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-secondary);
+  padding: 5px 10px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all var(--transition-fast);
+}
+
+.btn-quick:hover {
+  background: var(--color-accent-dim);
+  color: var(--color-accent-hover);
+  border-color: var(--color-accent);
+}
+
+.schedule-submit-btn {
+  padding: 10px var(--space-lg);
+  border-radius: var(--radius-sm);
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  height: fit-content;
+}
+
+.schedule-error {
+  color: var(--color-error);
+  font-size: 0.85rem;
+  margin-top: var(--space-md);
+}
+
+.schedule-error.hidden {
+  display: none;
+}
+
+@media (max-width: 900px) {
+  .schedule-form {
+    grid-template-columns: 1fr 1fr;
+  }
+  .schedule-field-channel {
+    grid-column: 1 / -1;
+  }
+  .schedule-submit-btn {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 500px) {
+  .schedule-form {
+    grid-template-columns: 1fr;
+  }
+
+  /* iOS renders datetime-local's native segments wider at larger font sizes -
+     shrinking this on phone-width screens gives min-width:0 more room to
+     actually take effect instead of still crowding the panel edge. */
+  .schedule-form input[type="datetime-local"] {
+    font-size: 0.75rem;
+    padding: 10px 4px;
+  }
+
+  /* Font-size/padding alone still isn't enough - iOS Safari's datetime-local
+     widget renders its own internal chrome at a width that ignores the
+     element's box entirely, so overflow:hidden on .schedule-field was
+     clipping straight through the control's right border instead of giving
+     a clean edge. A transform scales the whole PAINTED control (border
+     included) down after layout, which is what actually fits it inside the
+     card - shrinking font-size only affects the box the browser THINKS it
+     needs, not what it actually renders. */
+  .schedule-form input[type="datetime-local"] {
+    transform: scale(0.82);
+    transform-origin: left center;
+  }
+}
+
+/* --- List sections: Recording Now / Scheduled / Recorded --- */
+.recordings-section:empty {
+  display: none;
+}
+
+.section-title {
+  padding: 0 var(--space-xl) var(--space-md);
+  color: var(--color-text-secondary);
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.section-title-live {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  color: var(--color-error);
+}
+
+/* On the page (not the red player badge), the dot should match the
+   surrounding red text rather than the badge's hardcoded white. */
+.section-title-live .recording-dot,
+.recording-status.recording .recording-dot {
+  background: currentColor;
+}
+
+.recordings-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  padding: 0 var(--space-xl) var(--space-xl);
+}
+
+.recording-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-md) var(--space-lg);
+  transition: border-color var(--transition-fast);
+}
+
+.recording-row-active {
+  border-color: rgba(239, 68, 68, 0.35);
+  background: linear-gradient(180deg, rgba(239, 68, 68, 0.06), var(--color-bg-tertiary) 40%);
+}
+
+.recording-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.recording-channel {
+  color: var(--color-text-primary);
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.recording-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-md);
+  color: var(--color-text-secondary);
+  font-size: 0.85rem;
+}
+
+.recording-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 0.72rem;
+  letter-spacing: 0.03em;
+}
+
+.recording-status.recording {
+  color: var(--color-error);
+}
+
+.recording-status.completed {
+  color: var(--color-success);
+}
+
+.recording-status.error {
+  color: var(--color-warning);
+}
+
+.recording-status.scheduled {
+  color: var(--color-accent);
+}
+
+.recording-status.missed {
+  color: var(--color-text-muted);
+}
+
+.recording-status.missing {
+  color: var(--color-warning);
+}
+
+.recording-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-shrink: 0;
+}
+
+.row-extend {
+  display: flex;
+  gap: 6px;
+  padding-right: var(--space-sm);
+  margin-right: var(--space-sm);
+  border-right: 1px solid var(--color-border);
+}
+
+.recording-actions .btn-secondary,
+.recording-actions .btn-danger,
+.recording-actions .btn-primary {
+  padding: 8px var(--space-md);
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+  border: none;
+  transition: all var(--transition-fast);
+}
+
+@media (max-width: 600px) {
+  .recording-row {
+    flex-direction: column;
+    align-items: flex-start;
   }
 }

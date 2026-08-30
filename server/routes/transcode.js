@@ -29,7 +29,7 @@ transcodeSession.startCleanupInterval();
  * Body: { url: string, seekOffset?: number }
  */
 router.post('/session', async (req, res) => {
-    const { url, seekOffset, videoMode, videoCodec, audioCodec, audioChannels } = req.body;
+    const { url, seekOffset, videoMode, videoCodec, audioCodec, audioChannels, sessionType, maxResolution, quality, maxBitrateKbps } = req.body;
 
     if (!url) {
         return res.status(400).json({ error: 'URL is required' });
@@ -39,28 +39,38 @@ router.post('/session', async (req, res) => {
     const settings = await db.settings.get();
     const userAgent = db.getUserAgent(settings);
 
+    // maxResolution/quality can be overridden per-request (used by the "Lower
+    // Quality" manual retry when a channel is buffering) - otherwise falls
+    // back to the persisted global settings as before. An explicit
+    // maxResolution override also implies "don't upscale" for this session -
+    // otherwise a global upscale setting could silently fight the downscale
+    // the caller just asked for.
+    const resolutionOverridden = maxResolution !== undefined;
+
     try {
         const session = await transcodeSession.createSession(url, {
             ffmpegPath,
             userAgent,
             seekOffset: seekOffset || 0,
             hwEncoder: settings.hwEncoder || 'software',
-            maxResolution: settings.maxResolution || '1080p',
-            quality: settings.quality || 'medium',
+            maxResolution: maxResolution || settings.maxResolution || '1080p',
+            quality: quality || settings.quality || 'medium',
+            maxBitrateKbps: maxBitrateKbps || undefined,
             audioMixPreset: settings.audioMixPreset || 'auto', // Audio downmix preset
             // Upscaling options
-            upscaleEnabled: settings.upscaleEnabled || false,
+            upscaleEnabled: resolutionOverridden ? false : (settings.upscaleEnabled || false),
             upscaleMethod: settings.upscaleMethod || 'hardware',
             upscaleTarget: settings.upscaleTarget || '1080p',
             videoMode: videoMode, // 'copy' or 'encode'
             videoCodec: videoCodec, // 'h264', 'hevc', etc.
             audioCodec: audioCodec, // 'aac', 'ac3', etc.
-            audioChannels: audioChannels // number of channels (2=stereo)
+            audioChannels: audioChannels, // number of channels (2=stereo)
+            sessionType: sessionType // 'live' or 'vod' (default) - controls segment retention
         });
 
         await session.start();
 
-        // Wait for playlist to be ready (first segments generated)
+        // Wait for playlist to be ready (first segments generated).
         const ready = await session.waitForPlaylist(15000);
 
         if (!ready) {

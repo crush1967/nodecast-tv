@@ -47,6 +47,24 @@ router.delete('/', async (req, res) => {
     }
 });
 
+// Move a favorite up or down in the current user's manual order
+router.post('/:id/move', async (req, res) => {
+    try {
+        const { direction } = req.body;
+        if (direction !== 'up' && direction !== 'down') {
+            return res.status(400).json({ error: 'direction must be "up" or "down"' });
+        }
+
+        const moved = favorites.move(req.user.id, parseInt(req.params.id, 10), direction);
+        if (!moved) {
+            return res.status(409).json({ error: 'Already at that end of the list' });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Check if item is favorited by current user
 router.get('/check', async (req, res) => {
     try {

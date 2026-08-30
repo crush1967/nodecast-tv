@@ -22,6 +22,7 @@ class App {
         this.pages.series = new SeriesPage(this);
         this.pages.settings = new SettingsPage(this);
         this.pages.watch = new WatchPage(this);
+        this.pages.recordings = new RecordingsPage(this);
 
         this.init();
     }
@@ -114,14 +115,21 @@ class App {
             });
         });
 
-        // Now Playing indicator
-        const nowPlayingBtn = document.getElementById('now-playing-indicator');
-        if (nowPlayingBtn) {
-            nowPlayingBtn.addEventListener('click', (e) => {
-                e.preventDefault();
-                this.navigateTo('watch');
-            });
-        }
+        // Now Playing indicator - link jumps back to whichever player is
+        // active (live TV or the movie/series watch page); the stop button
+        // releases it from wherever you currently are, via whatever stop
+        // function the active player registered (see setNowPlaying below).
+        const nowPlayingLink = document.getElementById('now-playing-link');
+        nowPlayingLink?.addEventListener('click', (e) => {
+            e.preventDefault();
+            this.navigateTo(nowPlayingLink.dataset.page || 'watch');
+        });
+
+        document.getElementById('now-playing-stop')?.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            this.nowPlayingStopFn?.();
+        });
 
         // Toggle groups button
         document.getElementById('toggle-groups').addEventListener('click', () => {
@@ -238,6 +246,32 @@ class App {
         });
 
         navbar.appendChild(logoutLink);
+    }
+
+    /**
+     * Show the shared "Now Playing" navbar pill - called by whichever player
+     * (Live TV's VideoPlayer, or WatchPage for movies/series) currently has
+     * an active stream, since only one of them can hold the provider's
+     * connection at a time. `page` is what the pill's link navigates to
+     * ('live' or 'watch'); `onStop` is called when the pill's own stop
+     * button is tapped, so it works from any page without navigating back
+     * to the player first.
+     */
+    setNowPlaying(title, page, onStop) {
+        const indicator = document.getElementById('now-playing-indicator');
+        const textEl = document.getElementById('now-playing-text');
+        const link = document.getElementById('now-playing-link');
+        if (!indicator || !textEl || !link) return;
+
+        textEl.textContent = title || 'Now Playing';
+        link.dataset.page = page;
+        this.nowPlayingStopFn = onStop;
+        indicator.classList.remove('hidden');
+    }
+
+    clearNowPlaying() {
+        document.getElementById('now-playing-indicator')?.classList.add('hidden');
+        this.nowPlayingStopFn = null;
     }
 
     navigateTo(pageName, replaceHistory = false) {

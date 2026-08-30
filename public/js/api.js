@@ -64,6 +64,27 @@ const API = {
         estimateByUrl: (url, type) => API.request('POST', '/sources/estimate', { url, type }), // Estimate by URL (before creation)
     },
 
+    // Recordings
+    recordings: {
+        getAll: () => API.request('GET', '/recordings'),
+        getActive: () => API.request('GET', '/recordings/active'),
+        start: (url, channelName, durationMinutes = null) => API.request('POST', '/recordings/start', { url, channelName, durationMinutes }),
+        stop: (id) => API.request('POST', `/recordings/${id}/stop`),
+        delete: (id) => API.request('DELETE', `/recordings/${id}`),
+        // Plain URL (not fetch) so the browser handles the file save; token is passed
+        // as a query param since a normal <a href> navigation carries no Authorization header
+        getDownloadUrl: (id) => `/api/recordings/${id}/download?token=${encodeURIComponent(localStorage.getItem('authToken') || '')}`,
+        getStreamUrl: (id) => `${window.location.origin}/api/recordings/${id}/stream?token=${encodeURIComponent(localStorage.getItem('authToken') || '')}`
+    },
+
+    // Scheduled Recordings
+    schedules: {
+        getAll: () => API.request('GET', '/schedules'),
+        create: (payload) => API.request('POST', '/schedules', payload),
+        delete: (id) => API.request('DELETE', `/schedules/${id}`),
+        extend: (id, addMinutes) => API.request('POST', `/schedules/${id}/extend`, { addMinutes })
+    },
+
     // Channels (hidden items)
     channels: {
         getHidden: (sourceId = null) => API.request('GET', `/channels/hidden${sourceId ? `?sourceId=${sourceId}` : ''}`),
@@ -92,7 +113,14 @@ const API = {
         remove: (sourceId, itemId, itemType = 'channel') =>
             API.request('DELETE', '/favorites', { sourceId, itemId, itemType }),
         check: (sourceId, itemId, itemType = 'channel') =>
-            API.request('GET', `/favorites/check?sourceId=${sourceId}&itemId=${itemId}&itemType=${itemType}`)
+            API.request('GET', `/favorites/check?sourceId=${sourceId}&itemId=${itemId}&itemType=${itemType}`),
+        move: (favoriteId, direction) =>
+            API.request('POST', `/favorites/${favoriteId}/move`, { direction })
+    },
+
+    // Watch history
+    history: {
+        remove: (itemId) => API.request('DELETE', `/history/${encodeURIComponent(itemId)}`)
     },
 
     // Proxy

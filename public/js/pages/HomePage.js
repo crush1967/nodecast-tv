@@ -241,6 +241,23 @@ class HomePage {
                 });
             });
 
+            // Reorder buttons - stopPropagation so they don't also trigger the
+            // tile's own click-to-play handler above.
+            list.querySelectorAll('.tile-reorder-btn').forEach(btn => {
+                btn.addEventListener('click', async (e) => {
+                    e.stopPropagation();
+                    const tile = btn.closest('.channel-tile');
+                    const favoriteId = tile.dataset.favoriteId;
+                    const direction = btn.dataset.move;
+                    try {
+                        await window.API.request('POST', `/favorites/${favoriteId}/move`, { direction });
+                        await this.renderFavoriteChannels();
+                    } catch (err) {
+                        console.warn('[Dashboard] Could not reorder favorite:', err.message);
+                    }
+                });
+            });
+
             // Update scroll arrows after content renders
             this.updateScrollArrows();
 
@@ -256,7 +273,15 @@ class HomePage {
         const name = channel.name || 'Unknown';
 
         return `
-            <div class="channel-tile" data-channel-id="${channel.id}" data-source-id="${channel.sourceId}">
+            <div class="channel-tile" data-channel-id="${channel.id}" data-source-id="${channel.sourceId}" data-favorite-id="${channel.favoriteId}">
+                <div class="tile-reorder">
+                    <button class="tile-reorder-btn" data-move="up" title="Move earlier">
+                        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 14l5-5 5 5z"/></svg>
+                    </button>
+                    <button class="tile-reorder-btn" data-move="down" title="Move later">
+                        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 10l5 5 5-5z"/></svg>
+                    </button>
+                </div>
                 <div class="tile-logo">
                     <img src="${logoUrl}" alt="${name}" loading="lazy" onerror="this.onerror=null;this.src='/img/placeholder.png'">
                 </div>
@@ -317,6 +342,26 @@ class HomePage {
 
                     // Prioritize playing directly for resume tiles
                     this.playItem(item, true); // true for resume
+                }
+            });
+        });
+
+        // Remove buttons - stopPropagation so they don't also trigger the
+        // card's own click-to-resume handler above.
+        list.querySelectorAll('.card-remove-btn').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                const itemId = btn.dataset.removeId;
+                try {
+                    await window.API.history.remove(itemId);
+                    // Drop just this card rather than a full re-fetch/re-render -
+                    // cheaper and avoids a flash of the section re-rendering.
+                    btn.closest('.dashboard-card')?.remove();
+                    if (!list.querySelector('.dashboard-card')) {
+                        section.classList.add('hidden');
+                    }
+                } catch (err) {
+                    console.warn('[Dashboard] Could not remove history item:', err.message);
                 }
             });
         });
@@ -416,6 +461,9 @@ class HomePage {
 
         return `
             <div class="dashboard-card" data-id="${item_id}" data-type="${type}">
+                <button class="card-remove-btn" data-remove-id="${item_id}" title="Remove from Continue Watching">
+                    <svg viewBox="0 0 24 24" fill="currentColor"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+                </button>
                 <div class="card-image">
                     <img src="${posterUrl}" alt="${data.title || item.name}" loading="lazy" onerror="this.onerror=null;this.src='/img/poster-placeholder.jpg'">
                     <div class="progress-bar-container">

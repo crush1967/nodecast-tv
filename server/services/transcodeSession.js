@@ -29,6 +29,7 @@ const CACHE_DIR = path.join(process.cwd(), 'transcode-cache');
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes idle timeout
 const SEGMENT_DURATION = 4; // seconds per HLS segment
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // Check every 5 minutes
+const LIVE_HLS_LIST_SIZE = 20; // ~80s rolling window for live sessions (SEGMENT_DURATION * this)
 
 /**
  * Generate a unique session ID
@@ -69,6 +70,10 @@ class TranscodeSession extends EventEmitter {
             ffmpegPath: options.ffmpegPath || 'ffmpeg',
             userAgent: options.userAgent || 'Mozilla/5.0',
             seekOffset: options.seekOffset || 0,
+            // 'live' sessions (Live TV) roll off old segments - nothing in the UI seeks
+            // backward into live history, so keeping them just grows disk usage forever.
+            // 'vod' sessions (Movies/Series) must keep everything for backward seeking.
+            sessionType: options.sessionType === 'live' ? 'live' : 'vod',
             hwEncoder: options.hwEncoder || 'software',
             maxResolution: options.maxResolution || '1080p',
             quality: options.quality || 'medium',
@@ -203,12 +208,42 @@ class TranscodeSession extends EventEmitter {
             '-reconnect_delay_max', '3'
         );
 
-        args.push('-i', this.url);
-
-        // Add seek offset if specified (as output option to avoid Range requests)
+        // Seeking: input-side (-ss before -i) when a seek is actually requested,
+        // so FFmpeg issues an HTTP Range request and jumps straight to the
+        // target keyframe. This IS a VOD-only code path in practice (seekOffset
+        // only ever comes from resuming a movie/episode/recording; live
+        // channels never carry a stored progress to resume from), and VOD
+        // files serve Range requests fine even on providers that reject them
+        // for live playlists. Output-side seeking (-ss after -i) was measured
+        // to hang for the full length of the skipped portion instead of
+        // completing in under a second - the source paces delivery at roughly
+        // real-time speed, so "skip ahead by reading and discarding" takes
+        // about as long as the skip itself. A 2-minute resume point made
+        // session creation take 2+ minutes (well past any reasonable timeout,
+        // and the failure/fallback loop that produced looked like the video
+        // being stuck in an endless restart loop).
         if (this.options.seekOffset > 0) {
             args.push('-ss', String(this.options.seekOffset));
         }
+
+        // Live sources on this provider are a redirect to a token-bearing CDN
+        // URL (line.kemotv.cc -> billy.frontcdn.me/auth/<token>...) that
+        // appears to expire quickly. FFmpeg's own HLS reload logic re-polls
+        // whatever URL it originally resolved rather than re-following the
+        // redirect fresh each time, so once that token expires it starts
+        // getting "HTTP error 404" / "Failed to reload playlist" and the
+        // session dies within seconds - looking exactly like ongoing
+        // buffering/pausing even with a correctly capped bitrate. Our own
+        // /api/proxy/stream route does a plain fetch() per request, which
+        // transparently re-follows the redirect and gets a fresh token every
+        // time - routing FFmpeg's input through it (self-referential, same
+        // process) fixes reloads the same way direct/proxied client playback
+        // already survives them. VOD sources (movies/series/recordings) are
+        // direct file URLs with no such redirect, so this is live-only.
+        const inputUrl = this.options.sessionType === 'live'
+            ? `http://localhost:${process.env.PORT || 3000}/api/proxy/stream?url=${encodeURIComponent(this.url)}`
+            : this.url;
+        args.push('-i', inputUrl);
 
         // Map streams
         args.push('-map', '0:v:0');
@@ -270,11 +305,17 @@ class TranscodeSession extends EventEmitter {
         }
 
         // HLS output options
+        const isLive = this.options.sessionType === 'live';
         args.push(
             '-f', 'hls',
             '-hls_time', String(SEGMENT_DURATION),
-            '-hls_list_size', '0', // Keep all segments in playlist
-            '-hls_flags', 'independent_segments+append_list',
+            // VOD (movies/series) keeps every segment so seeking backward always works.
+            // Live TV has no seek UI at all, so an unbounded list just grows disk forever -
+            // roll it off to a ~80s rolling window (LIVE_HLS_LIST_SIZE segments) instead.
+            '-hls_list_size', isLive ? String(LIVE_HLS_LIST_SIZE) : '0',
+            '-hls_flags', isLive
+                ? 'independent_segments+append_list+delete_segments'
+                : 'independent_segments+append_list',
             '-hls_segment_type', 'mpegts',
             '-hls_segment_filename', path.join(this.dir, 'seg%04d.ts'),
             this.playlistPath
@@ -353,7 +394,7 @@ class TranscodeSession extends EventEmitter {
             case 'software':
             case 'auto':
             default:
-                this.addSoftwareEncoderArgs(args, resolution, qp.software);
+                this.addSoftwareEncoderArgs(args, resolution, qp.software, this.options.maxBitrateKbps);
                 break;
         }
     }
@@ -406,7 +447,9 @@ class TranscodeSession extends EventEmitter {
                 case 'vaapi':
                     return `scale_vaapi=w=-2:h=${height}:format=nv12`;
                 case 'qsv':
-                    return `scale_qsv=w=-2:h=${height}:format=nv12`;
+                    // scale_qsv rejects -2 ("Size values less than -1 are not acceptable") -
+                    // unlike scale_cuda/software scale, it only accepts -1 for auto-width.
+                    return `scale_qsv=w=-1:h=${height}:format=nv12`;
                 case 'amf':
                     // AMF uses CPU decode, so use software scale
                     return useUpscale ? `scale=-2:${height}:flags=lanczos` : `scale=-2:${height}`;
@@ -472,8 +515,9 @@ class TranscodeSession extends EventEmitter {
             '-c:v', 'h264_vaapi',
             '-profile:v', 'main',      // Use main profile for compatibility
             '-global_quality', String(qp),
-            '-bf', '3',
-            '-pix_fmt', 'yuv420p'      // Force 8-bit output for compatibility
+            '-bf', '3'
+            // No -pix_fmt here: same reason as QSV above - these are VAAPI hardware
+            // surfaces already in nv12 via the scale_vaapi filter, not software frames.
         );
     }
 
@@ -489,15 +533,18 @@ class TranscodeSession extends EventEmitter {
             '-preset', 'medium',
             '-global_quality', String(qp),
             '-look_ahead', '1',
-            '-look_ahead_depth', '40',
-            '-pix_fmt', 'yuv420p'      // Force 8-bit output for compatibility
+            '-look_ahead_depth', '40'
+            // No -pix_fmt here: frames are QSV hardware surfaces at this point
+            // (format=nv12 is already set inside the scale_qsv filter above).
+            // Forcing a software pix_fmt conversion on a hardware surface breaks
+            // the filter graph ("Function not implemented").
         );
     }
 
     /**
      * Software encoder arguments (fallback)
      */
-    addSoftwareEncoderArgs(args, height, crf) {
+    addSoftwareEncoderArgs(args, height, crf, maxBitrateKbps) {
         // Software scaling (use Lanczos for upscaling if enabled)
         args.push('-vf', this.buildScaleFilter('software', height));
 
@@ -509,23 +556,56 @@ class TranscodeSession extends EventEmitter {
             '-level', '4.1',
             '-pix_fmt', 'yuv420p'      // Force 8-bit output for compatibility (fixes 10-bit input errors)
         );
+
+        // CRF alone lets bitrate float with content complexity - fine for
+        // normal quality/upscaling, but defeats the point of the "Lower
+        // Quality" resilience mode, whose whole purpose is capping bandwidth
+        // need. High-motion content (sports - which is most of what's likely
+        // to get retried this way) can still spike well past what a shaky
+        // connection can sustain under CRF alone. -maxrate/-bufsize enforces
+        // a hard ceiling via VBV; only applied when the caller explicitly
+        // asks for it.
+        if (maxBitrateKbps) {
+            args.push(
+                '-maxrate', `${maxBitrateKbps}k`,
+                '-bufsize', `${maxBitrateKbps * 2}k`
+            );
+        }
     }
 
     /**
      * Stop the transcoding process
      */
+    // Returns a promise that resolves once the FFmpeg process has actually
+    // exited (or after a safety timeout), not just once the kill signal was
+    // sent. Callers that only fire-and-forget (don't await) are unaffected -
+    // this matters for cleanup()/removeSession(), whose callers (the DELETE
+    // route, and ultimately the client's stop-before-starting-a-new-session
+    // flow when switching quality) need the OLD connection to this
+    // one-connection-at-a-time provider to actually be gone before a new one
+    // is opened, not just "asked to close eventually".
     stop() {
-        if (this.process) {
-            console.log(`[TranscodeSession ${this.id}] Stopping FFmpeg process`);
-            this.process.kill('SIGTERM');
-            // Force kill after 2 seconds if still running
-            setTimeout(() => {
-                if (this.process) {
-                    this.process.kill('SIGKILL');
-                }
-            }, 2000);
+        if (!this.process) {
+            this.status = 'stopped';
+            return Promise.resolve();
         }
+
+        console.log(`[TranscodeSession ${this.id}] Stopping FFmpeg process`);
+        const exited = new Promise(resolve => {
+            this.once('exit', resolve);
+            // Safety net in case 'exit' never fires for some reason - don't
+            // let a stuck process hang the caller forever.
+            setTimeout(resolve, 3000);
+        });
+        this.process.kill('SIGTERM');
+        // Force kill after 2 seconds if still running
+        setTimeout(() => {
+            if (this.process) {
+                this.process.kill('SIGKILL');
+            }
+        }, 2000);
         this.status = 'stopped';
+        return exited;
     }
 
     /**
@@ -632,7 +712,7 @@ class TranscodeSession extends EventEmitter {
      * Delete session directory and all segments
      */
     async cleanup() {
-        this.stop();
+        await this.stop();
         try {
             await fs.rm(this.dir, { recursive: true, force: true });
             console.log(`[TranscodeSession ${this.id}] Cleaned up session directory`);

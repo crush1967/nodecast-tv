@@ -103,6 +103,7 @@ class SettingsPage {
         // Stream processing (use -tc suffix IDs from Transcoding tab)
         const forceProxyToggle = document.getElementById('setting-force-proxy-tc');
         const autoTranscodeToggle = document.getElementById('setting-auto-transcode-tc');
+        const reliableStreamingToggle = document.getElementById('setting-reliable-streaming-tc');
         const forceTranscodeToggle = document.getElementById('setting-force-transcode-tc');
         const forceVideoTranscodeToggle = document.getElementById('setting-force-video-transcode-tc');
         const forceRemuxToggle = document.getElementById('setting-force-remux-tc');
@@ -127,6 +128,7 @@ class SettingsPage {
         if (qualitySelect) qualitySelect.value = s.quality || 'medium';
         if (forceProxyToggle) forceProxyToggle.checked = s.forceProxy === true;
         if (autoTranscodeToggle) autoTranscodeToggle.checked = s.autoTranscode !== false;
+        if (reliableStreamingToggle) reliableStreamingToggle.checked = s.reliableStreaming === true;
         if (forceTranscodeToggle) forceTranscodeToggle.checked = s.forceTranscode === true;
         if (forceVideoTranscodeToggle) forceVideoTranscodeToggle.checked = s.forceVideoTranscode === true;
         if (forceRemuxToggle) forceRemuxToggle.checked = s.forceRemux || false;
@@ -209,6 +211,11 @@ class SettingsPage {
 
         autoTranscodeToggle?.addEventListener('change', () => {
             this.app.player.settings.autoTranscode = autoTranscodeToggle.checked;
+            this.app.player.saveSettings();
+        });
+
+        reliableStreamingToggle?.addEventListener('change', () => {
+            this.app.player.settings.reliableStreaming = reliableStreamingToggle.checked;
             this.app.player.saveSettings();
         });
 

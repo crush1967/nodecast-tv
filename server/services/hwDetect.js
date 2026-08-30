@@ -115,6 +115,27 @@ async function detectVAAPI() {
 }
 
 /**
+ * List GPU names on Windows. wmic is deprecated/removed on newer Windows
+ * (11 24H2+), so try PowerShell's CIM cmdlet first and fall back to wmic
+ * for older systems where it's still present.
+ */
+function getWindowsGpuNames() {
+    try {
+        const result = execSync(
+            'powershell -NoProfile -Command "(Get-CimInstance Win32_VideoController).Name"',
+            { timeout: 5000, encoding: 'utf-8', windowsHide: true }
+        );
+        if (result.trim()) return result;
+    } catch (err) {
+        // PowerShell/CIM unavailable - fall through to wmic
+    }
+    return execSync(
+        'wmic path win32_VideoController get name',
+        { timeout: 5000, encoding: 'utf-8', windowsHide: true }
+    );
+}
+
+/**
  * Detect Intel QuickSync support
  * Checks if FFmpeg can use QSV
  */
@@ -124,11 +145,7 @@ async function detectQuickSync() {
         let hasIntelGpu = false;
 
         if (os.platform() === 'win32') {
-            // Windows: Check via WMIC
-            const result = execSync(
-                'wmic path win32_VideoController get name',
-                { timeout: 5000, encoding: 'utf-8', windowsHide: true }
-            );
+            const result = getWindowsGpuNames();
             hasIntelGpu = result.toLowerCase().includes('intel');
         } else if (os.platform() === 'linux') {
             // Linux: Check lspci

@@ -9,6 +9,18 @@ function isMobile() {
 }
 
 class VideoPlayer {
+    // Manual quality-override presets for the "Lower Quality" retry (see the
+    // long comment in play() for why this exists at all - this provider has
+    // no adaptive bitrate ladder, so there's nothing to fall back to except
+    // re-encoding server-side). maxBitrateKbps enforces a hard VBV ceiling
+    // (see addSoftwareEncoderArgs) - CRF alone lets bitrate float with scene
+    // complexity, which defeats the point for the sports-heavy channels this
+    // is most likely to get used on.
+    static QUALITY_OVERRIDE_PRESETS = {
+        '720p': { maxResolution: '720p', quality: 'medium', maxBitrateKbps: 2500 },
+        '480p': { maxResolution: '480p', quality: 'low', maxBitrateKbps: 1200 }
+    };
+
     constructor() {
         this.video = document.getElementById('video-player');
 
@@ -27,7 +39,16 @@ class VideoPlayer {
         this.overlayDuration = 5000; // 5 seconds
         this.isUsingProxy = false;
         this.currentUrl = null;
+        this.rawStreamUrl = null; // original upstream URL, before any transcode/remux/proxy rewriting
         this.settingsLoaded = false;
+        this.playToken = 0; // guards against overlapping play() calls (e.g. rapidly toggling
+        // quality) resolving out of order and leaving state from a superseded call in place
+
+        // Recording state
+        this.activeRecordingId = null;
+        this.recordingUrl = null;
+        this.recordingStartedAt = null;
+        this.recordingTimerInterval = null;
 
         // Settings - start with defaults, load from server async
         this.settings = this.getDefaultSettings();
@@ -50,6 +71,7 @@ class VideoPlayer {
             lastVolume: 80,
             autoPlayNextEpisode: false,
             forceProxy: false,
+            reliableStreaming: false,
             forceTranscode: false,
             forceRemux: false,
             autoTranscode: true,
@@ -118,9 +140,19 @@ class VideoPlayer {
             maxMaxBufferLength: 60,        // Absolute max buffer 60 seconds
             maxBufferSize: 60 * 1000 * 1000, // 60MB max buffer size
             maxBufferHole: 1.0,            // Allow 1s holes in buffer (helps with discontinuities)
-            // Live stream settings - stay further from live edge for stability
-            liveSyncDurationCount: 3,      // Stay 3 segments behind live
-            liveMaxLatencyDurationCount: 10, // Allow up to 10 segments behind before catching up
+            // Live stream settings - stay further from live edge for stability.
+            // Measured this provider's actual buffer behavior directly: it
+            // saw-tooths between ~1s and ~11s (one segment's worth) every
+            // reload cycle rather than building a deep cushion, and at least
+            // once dipped to 0.06s with readyState briefly dropping below
+            // HAVE_ENOUGH_DATA - the edge of a visible stall. Sitting further
+            // behind the live edge (5 segments instead of 3) gives each
+            // segment more real time to have already downloaded by the time
+            // playback reaches it, which is the only real lever available
+            // here - the underlying cause (this provider's own manifest
+            // reload/redirect cadence) isn't something we control.
+            liveSyncDurationCount: 5,      // Stay 5 segments behind live
+            liveMaxLatencyDurationCount: 12, // Allow up to 12 segments behind before catching up
             liveBackBufferLength: 30,      // Keep 30s of back buffer for seeking
             // Audio discontinuity handling (fixes garbled audio during ad transitions)
             stretchShortVideoTrack: true,  // Stretch short segments to avoid gaps
@@ -176,12 +208,26 @@ class VideoPlayer {
             window.addEventListener('resize', updateIosUiBottom);
         }
 
-        // iOS: use custom --vh unit to avoid 100vh issues with dynamic toolbar
+        // iOS: use custom --vh unit to avoid 100vh issues with dynamic toolbar.
+        // This has to be recalculated on rotation, not just set once at load -
+        // window.innerHeight swaps on orientation change, and without updating
+        // both the variable and the container's height, the container keeps
+        // its old (now wrong) height after rotating, effectively hiding the
+        // video off-viewport.
         const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent);
         if (isIOS && this.container) {
-            const vh = window.innerHeight * 0.01;
-            document.documentElement.style.setProperty('--vh', `${vh}px`);
-            this.container.style.height = 'calc(var(--vh) * 100)';
+            const updateIosViewportHeight = () => {
+                const vh = window.innerHeight * 0.01;
+                document.documentElement.style.setProperty('--vh', `${vh}px`);
+                this.container.style.height = 'calc(var(--vh) * 100)';
+            };
+
+            updateIosViewportHeight();
+            window.addEventListener('orientationchange', updateIosViewportHeight);
+            window.addEventListener('resize', updateIosViewportHeight);
+            if (window.visualViewport) {
+                window.visualViewport.addEventListener('resize', updateIosViewportHeight);
+            }
         }
 
         // Apply safe area + iOS toolbar padding to controls overlay
@@ -231,8 +277,17 @@ class VideoPlayer {
             togglePlay();
         });
 
-        // Update play/pause UI
-        const updatePlayUI = () => {
+        // Update play/pause UI. Exposed on `this` (not just a local closure)
+        // so a rejected play() call elsewhere - e.g. iOS blocking autoplay
+        // after the async delay of starting a transcode session - can force a
+        // refresh directly. Normally this only needs to run on the video's
+        // own 'play'/'pause' events, but a rejected play() never fires either
+        // one (the video was already paused and never actually transitions),
+        // so without this, the one button that would let the user manually
+        // resume (tap = a fresh user gesture, which autoplay policies allow)
+        // never appears - the video sits there loaded but frozen with no way
+        // to recover.
+        this.updatePlayUI = () => {
             const isPaused = this.video.paused;
             const hasVideo = this.video.src && this.video.src !== '' && this.video.readyState > 0;
 
@@ -251,8 +306,8 @@ class VideoPlayer {
             }
         };
 
-        this.video.addEventListener('play', updatePlayUI);
-        this.video.addEventListener('pause', updatePlayUI);
+        this.video.addEventListener('play', this.updatePlayUI);
+        this.video.addEventListener('pause', this.updatePlayUI);
 
         // Loading spinner
         this.video.addEventListener('waiting', () => {
@@ -261,6 +316,14 @@ class VideoPlayer {
 
         this.video.addEventListener('canplay', () => {
             this.loadingSpinner?.classList.remove('show');
+            // Also refresh play/pause UI here, not just on 'play'/'pause' -
+            // canplay fires once there's decodable data regardless of whether
+            // a play() call actually succeeded, so this is the one place
+            // guaranteed to catch a silently-rejected autoplay (no 'play' or
+            // 'pause' event fires for that, since the video never actually
+            // changes state) and show the center play button so there's a
+            // way to manually resume instead of a frozen, unrecoverable video.
+            this.updatePlayUI?.();
         });
 
         // Mute/Volume
@@ -348,6 +411,116 @@ class VideoPlayer {
             e.stopPropagation();
             this.copyStreamUrl();
             overflowMenu?.classList.add('hidden');
+        });
+
+        // AirPlay - only Safari/WebKit exposes this API, so the button stays
+        // hidden everywhere else (Control Center screen mirroring still works
+        // as a fallback on iOS regardless, this is just the nicer per-video
+        // cast that doesn't mirror the whole phone UI).
+        const btnAirplay = document.getElementById('btn-airplay');
+        if (btnAirplay && typeof this.video.webkitShowPlaybackTargetPicker === 'function') {
+            btnAirplay.classList.remove('hidden');
+            btnAirplay.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.video.webkitShowPlaybackTargetPicker();
+                overflowMenu?.classList.add('hidden');
+            });
+        }
+
+        // Stop - releases the current channel/connection without navigating
+        // away, so it doesn't get silently auto-resumed by LivePage.show()
+        // when you come back to Live TV (that resume is intentional recovery
+        // from a background-stop, not meant to fight an explicit Stop click).
+        const btnStopChannel = document.getElementById('btn-stop-channel');
+        btnStopChannel?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.currentChannel = null;
+            this.stop();
+            overflowMenu?.classList.add('hidden');
+        });
+
+        // Lower Quality - manual retry at a capped bitrate/resolution when a
+        // channel keeps stalling (see the long comment in play() for why).
+        // Cycles Off -> 720p -> 480p -> Off, and stays set across channel
+        // changes since a provider-side CDN issue usually isn't limited to a
+        // single channel.
+        const btnLowBitrate = document.getElementById('btn-low-bitrate');
+        const btnLowBitrateLabel = document.getElementById('btn-low-bitrate-label');
+        const qualityCycle = [null, '720p', '480p'];
+        const qualityLabels = {
+            null: 'Lower Quality (Reduce Buffering)',
+            '720p': 'Lower Quality: 720p (Click for 480p)',
+            '480p': 'Lower Quality: 480p (Click to Restore)'
+        };
+        btnLowBitrate?.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            // Disabled while a switch is in flight - starting a new transcode
+            // session takes several real seconds (FFmpeg startup + waiting for
+            // the first segment), and clicking again before the previous
+            // session has actually released its connection to the provider
+            // collides with it (this provider allows only one connection at a
+            // time), silently failing the second attempt into a broken
+            // fallback. This isn't just a UX nicety - it's what makes the
+            // cycle actually reliable instead of racing itself.
+            if (btnLowBitrate.disabled) return;
+            const nextIndex = (qualityCycle.indexOf(this.qualityOverride) + 1) % qualityCycle.length;
+            this.qualityOverride = qualityCycle[nextIndex];
+            if (btnLowBitrateLabel) {
+                btnLowBitrateLabel.textContent = `${qualityLabels[this.qualityOverride]} - Switching...`;
+            }
+            btnLowBitrate.disabled = true;
+            btnLowBitrate.classList.toggle('active', !!this.qualityOverride);
+            overflowMenu?.classList.add('hidden');
+            if (this.currentChannel) {
+                await this.play(this.currentChannel, this.rawStreamUrl);
+            }
+            btnLowBitrate.disabled = false;
+            if (btnLowBitrateLabel) {
+                btnLowBitrateLabel.textContent = qualityLabels[this.qualityOverride];
+            }
+        });
+
+        // Record
+        const btnRecord = document.getElementById('btn-record');
+        const recordDurationPanel = document.getElementById('record-duration-panel');
+        const recordDurationInput = document.getElementById('record-duration-input');
+        const btnRecordConfirm = document.getElementById('btn-record-confirm');
+
+        btnRecord?.addEventListener('click', (e) => {
+            e.stopPropagation();
+
+            // A recording is active -> clicking the row always stops it, regardless of
+            // which channel is currently on screen (only one recording is tracked client-side,
+            // so there's no ambiguity about which one "Stop Recording" refers to). Previously
+            // this compared against currentUrl, which changes to a local transcode/proxy URL
+            // whenever transcoding is active - making this comparison silently fail and the
+            // button do nothing instead of stopping.
+            if (this.activeRecordingId) {
+                this.stopRecording();
+                overflowMenu?.classList.add('hidden');
+                return;
+            }
+
+            // Otherwise reveal the inline duration field instead of starting right away
+            recordDurationPanel?.classList.toggle('hidden');
+            if (!recordDurationPanel?.classList.contains('hidden')) {
+                recordDurationInput?.focus();
+            }
+        });
+
+        btnRecordConfirm?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const raw = recordDurationInput?.value?.trim() || '';
+            this.startRecording(raw === '' ? null : Number(raw));
+            recordDurationPanel?.classList.add('hidden');
+            if (recordDurationInput) recordDurationInput.value = '';
+            overflowMenu?.classList.add('hidden');
+        });
+
+        recordDurationInput?.addEventListener('click', (e) => e.stopPropagation());
+        recordDurationInput?.addEventListener('keydown', (e) => {
+            e.stopPropagation();
+            if (e.key === 'Enter') btnRecordConfirm?.click();
         });
 
         // Close overflow menu when clicking outside
@@ -502,6 +675,195 @@ class VideoPlayer {
         }
     }
 
+
+    /**
+     * Start recording the currently playing channel.
+     * @param {number|null} durationMinutes - optional auto-stop duration; null = manual stop only
+     */
+    async startRecording(durationMinutes) {
+        if (!this.rawStreamUrl || !this.currentChannel) {
+            console.warn('[Player] No channel playing, cannot record');
+            return;
+        }
+
+        if (durationMinutes !== null && (!Number.isFinite(durationMinutes) || durationMinutes <= 0)) {
+            alert('Enter a positive number of minutes, or leave it blank.');
+            return;
+        }
+
+        // Many IPTV lines only allow ONE connection at a time - so recording must
+        // reuse whatever connection is already open for live viewing, not add a
+        // second one (which the provider may kill, taking down either the live
+        // view or the recording). currentUrl is whatever's actually driving
+        // playback right now: if transcoding/remuxing is active, that's a local
+        // relay URL, and recording from it shares that same single upstream
+        // connection. Only when playback is Direct (no local relay at all) does
+        // recording still need its own connection - unavoidable without forcing
+        // all playback through a server relay, which direct/passthrough exists
+        // specifically to avoid.
+        const recordUrl = this.currentUrl.startsWith('/')
+            ? window.location.origin + this.currentUrl
+            : this.currentUrl;
+
+        try {
+            const result = await API.recordings.start(recordUrl, this.currentChannel.name || this.currentChannel.tvgName, durationMinutes);
+            this.activeRecordingId = result.id;
+            this.recordingUrl = this.rawStreamUrl;
+            this.recordingStartedAt = Date.now();
+            this.startRecordingBadgeTimer();
+
+            // If a duration was set, clear the local badge once the server-side
+            // auto-stop should have finished, so it doesn't keep showing "REC" forever
+            if (durationMinutes) {
+                const recordingIdAtStart = this.activeRecordingId;
+                setTimeout(() => {
+                    if (this.activeRecordingId === recordingIdAtStart) {
+                        this.clearRecordingState();
+                    }
+                }, durationMinutes * 60 * 1000 + 2000);
+            }
+        } catch (err) {
+            console.error('[Player] Failed to start recording:', err);
+            alert('Failed to start recording: ' + err.message);
+        }
+    }
+
+    /**
+     * Reconcile local recording state with the server. activeRecordingId only ever
+     * lives in this tab's memory - a page reload (or the app being scripted/reloaded
+     * externally) wipes it even though a recording can still be running server-side.
+     * Called whenever a channel starts playing so the Record button reflects reality.
+     */
+    async syncRecordingState() {
+        try {
+            const active = await API.recordings.getActive();
+            // Match by channel name, not URL: the recorded URL is often a local
+            // relay (transcode/remux session) reused from live playback so it
+            // shares the one connection the IPTV line allows, and that relay's
+            // URL is a fresh session ID every time - never comparable to a
+            // stable identifier like rawStreamUrl.
+            const channelName = this.currentChannel?.name || this.currentChannel?.tvgName;
+            const match = active.find(r => r.channelName === channelName);
+            if (match) {
+                this.activeRecordingId = match.id;
+                this.recordingUrl = this.rawStreamUrl;
+                this.recordingStartedAt = match.startedAt;
+                this.startRecordingBadgeTimer();
+            } else if (this.recordingUrl === this.rawStreamUrl) {
+                // We thought this channel was recording but the server disagrees
+                // (e.g. it auto-stopped via duration while we were away) - clear up.
+                this.clearRecordingState();
+            }
+        } catch (err) {
+            console.warn('[Player] Failed to sync recording state:', err);
+        }
+    }
+
+    /**
+     * Stop the active recording for the currently playing channel
+     */
+    async stopRecording() {
+        if (!this.activeRecordingId) return;
+        try {
+            await API.recordings.stop(this.activeRecordingId);
+        } catch (err) {
+            console.error('[Player] Failed to stop recording:', err);
+            if (err.message === 'Recording not found') {
+                // The server has no record of it at all - nothing to keep showing
+                // as "recording" locally, whatever it was is already gone.
+                this.clearRecordingState();
+            } else {
+                // A real failure (network/server error) - don't clear local state,
+                // that would show "not recording" while FFmpeg might still be running.
+                alert('Failed to stop recording: ' + err.message + '\n\nCheck the Recordings page to confirm its status.');
+            }
+            return;
+        }
+        this.clearRecordingState();
+    }
+
+    /**
+     * Reset local recording UI state (does not stop the server-side recording -
+     * used when navigating away from the recording's channel)
+     */
+    clearRecordingState() {
+        this.activeRecordingId = null;
+        this.recordingUrl = null;
+        this.recordingStartedAt = null;
+        if (this.recordingTimerInterval) {
+            clearInterval(this.recordingTimerInterval);
+            this.recordingTimerInterval = null;
+        }
+        this.updateRecordingBadge();
+    }
+
+    startRecordingBadgeTimer() {
+        if (this.recordingTimerInterval) clearInterval(this.recordingTimerInterval);
+        this.updateRecordingBadge();
+        let tick = 0;
+        this.recordingTimerInterval = setInterval(() => {
+            this.updateRecordingBadge();
+            // The badge's elapsed time is just local arithmetic - it has no way to
+            // notice the recording died server-side (network drop, provider killed
+            // the connection, duration auto-stop) unless we actually ask. Without
+            // this, "REC 06:18" can keep counting up indefinitely after the real
+            // recording finished minutes ago. Check every 5s, not every tick, to
+            // avoid hammering the server while still catching staleness quickly.
+            tick++;
+            if (tick % 5 === 0) this.verifyRecordingStillActive();
+        }, 1000);
+    }
+
+    /**
+     * Confirm the recording this tab thinks is running is still actually
+     * active server-side; if not, clear the stale local state and let the
+     * user know instead of leaving a phantom "REC" badge counting forever.
+     */
+    async verifyRecordingStillActive() {
+        if (!this.activeRecordingId) return;
+        try {
+            const active = await API.recordings.getActive();
+            const stillActive = active.some(r => r.id === this.activeRecordingId);
+            if (!stillActive) {
+                console.warn('[Player] Recording ended server-side without notice - clearing stale badge');
+                const wasChannel = this.recordingUrl === this.rawStreamUrl;
+                this.clearRecordingState();
+                if (wasChannel) {
+                    alert('Recording stopped earlier than expected (check the Recordings page for details - this is often the IPTV provider limiting concurrent connections if you were also watching live).');
+                }
+            }
+        } catch (err) {
+            // Network hiccup - don't clear state on an inconclusive check, only
+            // on a confirmed "server says it's not active".
+            console.warn('[Player] Failed to verify recording status:', err);
+        }
+    }
+
+    updateRecordingBadge() {
+        const badge = document.getElementById('player-recording-badge');
+        const timeEl = document.getElementById('player-recording-time');
+        const label = document.getElementById('btn-record-label');
+        if (!badge) return;
+
+        // The button always controls whatever the one active recording is (see click
+        // handler), regardless of which channel is on screen right now.
+        if (label) label.textContent = this.activeRecordingId ? 'Stop Recording' : 'Record';
+
+        // The elapsed-time badge, on the other hand, should only show for the channel
+        // actually being recorded - showing "REC 04:12" over an unrelated channel would
+        // be confusing, even though Stop Recording still correctly targets the real one.
+        const isRecordingThisChannel = this.activeRecordingId && this.recordingUrl === this.rawStreamUrl;
+        if (!isRecordingThisChannel) {
+            badge.classList.add('hidden');
+            return;
+        }
+
+        const elapsedSec = Math.floor((Date.now() - this.recordingStartedAt) / 1000);
+        const mins = String(Math.floor(elapsedSec / 60)).padStart(2, '0');
+        const secs = String(elapsedSec % 60).padStart(2, '0');
+        if (timeEl) timeEl.textContent = `REC ${mins}:${secs}`;
+        badge.classList.remove('hidden');
+    }
 
     /**
      * Toggle captions menu visibility
@@ -818,16 +1180,36 @@ class VideoPlayer {
             const res = await fetch('/api/transcode/session', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ url, ...options })
+                // This player is Live TV only (WatchPage has its own session helper for VOD),
+                // so mark every session 'live' - keeps the server-side segment list bounded
+                // instead of growing for as long as the channel stays open.
+                body: JSON.stringify({ url, sessionType: 'live', ...options })
             });
             if (!res.ok) throw new Error('Failed to start session');
             const session = await res.json();
-            this.currentSessionId = session.sessionId;
+            // Deliberately NOT setting this.currentSessionId here. This is a
+            // shared method with no idea which play() call invoked it or
+            // whether that call is still the current one - a stale call
+            // finishing after a newer one would overwrite currentSessionId
+            // with ITS (soon to be torn down) session id, leaving the actual
+            // active session untracked and never stopped. Orphaned like that,
+            // it keeps running and fighting the real session for this
+            // provider's one-connection-at-a-time limit, which looked like
+            // playback dying and looping - exactly what rapidly cycling the
+            // quality button triggered. Each call site sets currentSessionId
+            // itself, after its own stillCurrent() check has passed.
             return session.playlistUrl;
         } catch (err) {
             console.error('[Player] Session start failed:', err);
-            // Fallback to direct transcode if session fails
-            return `/api/transcode?url=${encodeURIComponent(url)}`;
+            // Previously fell back to `/api/transcode?url=...` here - that
+            // endpoint serves a raw MP4 stream, not an HLS playlist, and
+            // every caller passes this return value straight into
+            // hls.loadSource()/playHls(), which can never parse an MP4 as
+            // HLS. That "fallback" was guaranteed to fail a second time,
+            // cascading into exactly the repeated stop/restart pattern this
+            // was supposed to recover from. Rethrowing lets callers decide
+            // how to actually recover (e.g. fall back to normal playback).
+            throw err;
         }
     }
 
@@ -852,14 +1234,33 @@ class VideoPlayer {
      */
     async play(channel, streamUrl) {
         this.currentChannel = channel;
+        // Captured once, checked after every await below - if a newer play()
+        // call has started by the time an awaited step resolves, this call
+        // is stale and must not touch shared state (video element, hls
+        // instance, currentSessionId, etc). Without this, rapidly toggling
+        // quality could let two overlapping play() calls interleave and
+        // resolve out of order, leaving the player stuck on whichever one
+        // happened to finish last - including both of them briefly attaching
+        // audio to the video element, which is the most likely explanation
+        // for the momentary echo effect during a quality switch.
+        const myToken = ++this.playToken;
+        const stillCurrent = () => myToken === this.playToken;
 
         try {
             // Stop any WatchPage playback (movies/series) before starting Live TV
             window.app?.pages?.watch?.stop?.();
 
-            // Stop current playback
-            this.stop();
+            // Stop current playback - awaited so a prior transcode session
+            // (if any) has actually released its connection to the provider
+            // before we try to open a new one against the same
+            // one-connection-at-a-time source (see stop()'s own comment).
+            await this.stop();
+            if (!stillCurrent()) return; // superseded while the old session was stopping
             this.updateTranscodeStatus('hidden');
+
+            // Shared navbar pill - lets the connection be released from any
+            // page, not just while actually on Live TV.
+            window.app?.setNowPlaying(channel.name || channel.tvgName, 'live', () => this.stop());
 
             // Hide "select a channel" overlay
             this.overlay.classList.add('hidden');
@@ -870,6 +1271,82 @@ class VideoPlayer {
 
             // Determine if HLS or direct stream
             this.currentUrl = streamUrl;
+            this.rawStreamUrl = streamUrl; // stays the true source URL even as currentUrl gets rewritten below
+            this.updateRecordingBadge(); // Reflect this channel's recording state immediately
+            this.syncRecordingState(); // Reconcile with the server in case a page reload lost track of an in-progress recording
+
+            // Manual quality override - user-triggered when a channel keeps
+            // stalling, since this provider offers no adaptive bitrate ladder
+            // of its own (confirmed by inspecting several channels' manifests
+            // - every one is a single fixed-quality stream, so there's
+            // nothing for the player to automatically fall back to).
+            // Re-encodes server-side at a capped bitrate/resolution, trading
+            // this PC's CPU for a stream that needs less bandwidth. Persists
+            // across channel changes until explicitly turned off, since a
+            // provider-side CDN issue causing this is rarely limited to one
+            // channel.
+            if (this.qualityOverride) {
+                const preset = VideoPlayer.QUALITY_OVERRIDE_PRESETS[this.qualityOverride];
+                console.log(`[Player] Quality override active (${this.qualityOverride}) - starting reduced-quality transcode session`);
+                this.updateTranscodeStatus('transcoding', `${this.qualityOverride} Quality`);
+                let playlistUrl;
+                try {
+                    playlistUrl = await this.startTranscodeSession(streamUrl, {
+                        videoMode: 'encode',
+                        sessionType: 'live',
+                        ...preset
+                    });
+                } catch (err) {
+                    // Session genuinely failed to start (not just superseded -
+                    // that's handled below via stillCurrent()). Turn the
+                    // override off and fall through to normal playback rather
+                    // than get stuck retrying a broken state, or - as it used
+                    // to before startTranscodeSession stopped returning a
+                    // fake fallback URL - handing hls.js an MP4 endpoint it
+                    // can never parse as HLS.
+                    console.error('[Player] Quality override session failed, reverting to normal playback:', err);
+                    if (stillCurrent()) {
+                        this.qualityOverride = null;
+                        document.getElementById('btn-low-bitrate')?.classList.remove('active');
+                        const label = document.getElementById('btn-low-bitrate-label');
+                        if (label) label.textContent = 'Lower Quality (Reduce Buffering)';
+                    }
+                    playlistUrl = null;
+                }
+                if (!stillCurrent()) {
+                    // Superseded by a newer play() call while this session was
+                    // starting - release it immediately rather than leaving it
+                    // running unused. Extracted from this call's own
+                    // playlistUrl (not this.currentSessionId, which may
+                    // already belong to the newer, superseding call by now).
+                    // Nothing to release if the session failed in the first
+                    // place (playlistUrl null).
+                    const staleSessionId = playlistUrl?.match(/\/transcode\/([^/]+)\//)?.[1];
+                    if (staleSessionId) {
+                        fetch(`/api/transcode/${staleSessionId}`, { method: 'DELETE' }).catch(() => { });
+                    }
+                    return;
+                }
+                if (playlistUrl) {
+                    this.currentUrl = playlistUrl;
+                    this.currentSessionId = playlistUrl.match(/\/transcode\/([^/]+)\//)?.[1] || null;
+                    this.playHls(playlistUrl);
+                    // Deliberately skips updateNowPlaying/showNowPlayingOverlay/
+                    // fetchEpgData/channelChanged here, unlike every other
+                    // branch below - those are all appropriate for an actual
+                    // channel change, but this is the same channel at a
+                    // different quality. Showing the "now playing" overlay
+                    // again was actively counterproductive: it pops up
+                    // covering the "⋮" menu right as the quality-cycle
+                    // button's own label updates, making the change look like
+                    // it hadn't happened.
+                    return;
+                }
+                // playlistUrl is null - the session failed and qualityOverride
+                // was already reset above. Fall through to normal playback
+                // below instead of returning, so the channel still ends up
+                // watchable instead of just stuck.
+            }
 
             // CHECK: Auto Transcode (Smart) - probe first, then decide
             if (this.settings.autoTranscode) {
@@ -877,6 +1354,7 @@ class VideoPlayer {
                 try {
                     const probeRes = await fetch(`/api/probe?url=${encodeURIComponent(streamUrl)}`);
                     const info = await probeRes.json();
+                    if (!stillCurrent()) return; // superseded by a newer play() call while probing
                     console.log(`[Player] Probe result: video=${info.video}, audio=${info.audio}, ${info.width}x${info.height}, compatible=${info.compatible}`);
 
                     // Store probe result for quality badge display
@@ -916,13 +1394,23 @@ class VideoPlayer {
                         const statusMode = this.settings.upscaleEnabled ? 'upscaling' : 'transcoding';
 
                         this.updateTranscodeStatus(statusMode, statusText);
-                        const playlistUrl = await this.startTranscodeSession(streamUrl, {
-                            videoMode,
-                            videoCodec: info.video,
-                            audioCodec: info.audio,
-                            audioChannels: info.audioChannels
-                        });
+                        let playlistUrl;
+                        try {
+                            playlistUrl = await this.startTranscodeSession(streamUrl, {
+                                videoMode,
+                                videoCodec: info.video,
+                                audioCodec: info.audio,
+                                audioChannels: info.audioChannels,
+                                sessionType: 'live'
+                            });
+                        } catch (err) {
+                            console.error('[Player] Transcode session failed:', err);
+                            if (stillCurrent()) this.showError('Failed to start playback for this channel');
+                            return;
+                        }
+                        if (!stillCurrent()) return;
                         this.currentUrl = playlistUrl; // Update currentUrl for HLS reload
+                        this.currentSessionId = playlistUrl.match(/\/transcode\/([^/]+)\//)?.[1] || null;
 
                         this.playHls(playlistUrl);
 
@@ -935,7 +1423,7 @@ class VideoPlayer {
                         // Raw .ts container - use remux
                         console.log('[Player] Auto: Using remux (.ts container)');
                         this.updateTranscodeStatus('remuxing', 'Remux (Auto)');
-                        const remuxUrl = `/api/remux?url=${encodeURIComponent(streamUrl)}`;
+                        const remuxUrl = `/api/remux?url=${encodeURIComponent(streamUrl)}&audioCodec=${encodeURIComponent(info.audio || '')}`;
                         this.currentUrl = remuxUrl;
                         this.video.src = remuxUrl;
                         this.video.play().catch(e => {
@@ -949,6 +1437,47 @@ class VideoPlayer {
                     }
                     // Compatible - fall through to normal HLS.js path
                     console.log('[Player] Auto: Using HLS.js (compatible)');
+
+                    if (this.settings.reliableStreaming) {
+                        // Route through a local server-side copy-remux session instead
+                        // of letting the browser read the provider directly. The server
+                        // holds one steady connection and absorbs the provider's network
+                        // jitter/token churn; the browser just reads local segments over
+                        // the LAN, the same way on HTTP and HTTPS. videoMode: 'copy'
+                        // means no re-encoding (already browser-compatible), so this is
+                        // cheap on CPU - it's a remux, not a transcode.
+                        console.log('[Player] Reliable Streaming enabled. Starting copy session...');
+                        this.updateTranscodeStatus('transcoding', 'Buffering (Server)');
+                        let playlistUrl;
+                        try {
+                            playlistUrl = await this.startTranscodeSession(streamUrl, {
+                                videoMode: 'copy',
+                                videoCodec: info.video,
+                                audioCodec: info.audio,
+                                audioChannels: info.audioChannels,
+                                sessionType: 'live'
+                            });
+                        } catch (err) {
+                            console.error('[Player] Reliable streaming session failed, falling back to direct playback:', err);
+                            playlistUrl = null;
+                        }
+                        if (!stillCurrent()) {
+                            const staleSessionId = playlistUrl?.match(/\/transcode\/([^/]+)\//)?.[1];
+                            if (staleSessionId) fetch(`/api/transcode/${staleSessionId}`, { method: 'DELETE' }).catch(() => {});
+                            return;
+                        }
+                        if (playlistUrl) {
+                            this.currentUrl = playlistUrl;
+                            this.currentSessionId = playlistUrl.match(/\/transcode\/([^/]+)\//)?.[1] || null;
+                            this.playHls(playlistUrl);
+                            this.updateNowPlaying(channel);
+                            this.showNowPlayingOverlay();
+                            this.fetchEpgData(channel);
+                            window.dispatchEvent(new CustomEvent('channelChanged', { detail: channel }));
+                            return;
+                        }
+                        // playlistUrl null - fall through to normal direct playback below
+                    }
                 } catch (err) {
                     console.warn('[Player] Probe failed, using normal playback:', err.message);
                     // Continue with normal playback on probe failure
@@ -961,42 +1490,22 @@ class VideoPlayer {
                 const statusMode = this.settings.upscaleEnabled ? 'upscaling' : 'transcoding';
                 console.log(`[Player] ${statusText} enabled. Starting session (encode)...`);
                 this.updateTranscodeStatus(statusMode, statusText);
-                const playlistUrl = await this.startTranscodeSession(streamUrl, { videoMode: 'encode' });
+                let playlistUrl;
+                try {
+                    playlistUrl = await this.startTranscodeSession(streamUrl, { videoMode: 'encode' });
+                } catch (err) {
+                    console.error('[Player] Transcode session failed:', err);
+                    if (stillCurrent()) this.showError('Failed to start playback for this channel');
+                    return;
+                }
+                if (!stillCurrent()) return;
                 this.currentUrl = playlistUrl;
+                this.currentSessionId = playlistUrl.match(/\/transcode\/([^/]+)\//)?.[1] || null;
 
                 // Load HLS
                 this.updateNowPlaying(channel, 'Transcoding (Video)');
-                // ... (rest is same logic flow, simplified by just falling through to playHls call if I refactored)
-                // But for minimize drift, I'll copy the block logic for HLS playback init
-                // Actually, I can just fall through if I set looksLikeHls = true?
-                // No, play logic is sequential.
-                if (Hls.isSupported()) {
-                    // Start HLS
-                    // ... this repeats code. I should probably just set currentUrl and let HLS block handle?
-                    // But HLS block is lower down.
-                    // I will just execute the HLS init here as before.
-
-                    // Actually, easiest way is to re-assign streamUrl and goto start? No.
-                    // Copy existing forceTranscode block logic
-                    if (this.hls) {
-                        this.hls.destroy();
-                    }
-                    this.hls = new Hls();
-                    this.hls.loadSource(playlistUrl);
-                    this.hls.attachMedia(this.video);
-                    this.hls.on(Hls.Events.MANIFEST_PARSED, () => {
-                        this.video.play().catch(console.error);
-                    });
-                    // Handle errors
-                    this.hls.on(Hls.Events.ERROR, (event, data) => {
-                        if (data.fatal) {
-                            console.log('[Player] HLS fatal error');
-                            this.hls.destroy();
-                        }
-                    });
-
-                    return; // Exit
-                }
+                this.playHls(playlistUrl);
+                return;
             }
 
             // CHECK: Force Audio Transcode (Copy Video) - legacy forceTranscode setting
@@ -1012,8 +1521,17 @@ class VideoPlayer {
                     videoCodec = info.video;
                 } catch (e) { console.warn('Probe failed for force audio, assuming h264'); }
 
-                const playlistUrl = await this.startTranscodeSession(streamUrl, { videoMode: 'copy', videoCodec });
+                let playlistUrl;
+                try {
+                    playlistUrl = await this.startTranscodeSession(streamUrl, { videoMode: 'copy', videoCodec });
+                } catch (err) {
+                    console.error('[Player] Transcode session failed:', err);
+                    if (stillCurrent()) this.showError('Failed to start playback for this channel');
+                    return;
+                }
+                if (!stillCurrent()) return;
                 this.currentUrl = playlistUrl;
+                this.currentSessionId = playlistUrl.match(/\/transcode\/([^/]+)\//)?.[1] || null;
 
                 console.log('[Player] Playing transcoded HLS stream:', playlistUrl);
                 this.playHls(playlistUrl);
@@ -1026,12 +1544,48 @@ class VideoPlayer {
                 return; // Exit early
             }
 
+            // Detected the same reliable way as the AirPlay button: presence of
+            // webkitShowPlaybackTargetPicker, not just canPlayType (see the long
+            // comment on the native-HLS branch below for why canPlayType alone
+            // is unreliable). Needed here, before the proxy decision, because
+            // native Safari/iOS needs the proxy for a reason that has nothing to
+            // do with mixed content - see below.
+            const isSafariNative = typeof this.video.webkitShowPlaybackTargetPicker === 'function' &&
+                (this.video.canPlayType('application/vnd.apple.mpegurl') === 'probably' ||
+                    this.video.canPlayType('application/vnd.apple.mpegurl') === 'maybe');
+
             // Proactively use proxy for:
             // 1. User enabled "Force Proxy" in settings
             // 2. Known CORS-restricted domains (like Pluto TV)
-            // Note: Xtream sources are NOT auto-proxied because many providers IP-lock streams
+            // 3. Mixed content: this page is HTTPS but the stream is HTTP-only
+            //    (true of every channel on this provider). Left to react to it
+            //    instead, every single manifest/segment fetch would try the
+            //    direct HTTP URL first, get silently blocked by the browser's
+            //    mixed-content policy, and only THEN retry via proxy - a
+            //    wasted failed round-trip on every request in the live
+            //    reload cycle, not just an occasional one. That compounds
+            //    into far worse buffering over HTTPS than the same channel
+            //    ever showed in HTTP testing. Deciding this upfront instead
+            //    of reactively-on-error skips the doomed first attempt
+            //    entirely.
+            // 4. Native Safari/iOS playback, unconditionally - this provider's
+            //    live playlist URL redirects to a short-lived, token-bearing CDN
+            //    URL (see transcodeSession.js's identical fix for FFmpeg's own
+            //    input). Our proxy re-resolves that redirect fresh on every
+            //    manifest/segment request (see stream proxy's manifest rewrite
+            //    and cache); native Safari's reload logic does not - it keeps
+            //    polling the already-resolved CDN URL until the token expires,
+            //    then 404s forever, which looks exactly like "loads the first
+            //    frame, then freezes." iOS's native player also prefetches
+            //    segments more aggressively in parallel than HLS.js, which trips
+            //    this provider's concurrency limit (see upstreamSemaphore in
+            //    proxy.js) - a second, independent way to hit the same "frozen
+            //    after first frame" symptom that only the proxy's queuing fixes.
+            // Note: Xtream sources are otherwise NOT auto-proxied because many providers IP-lock streams
             const proxyRequiredDomains = ['pluto.tv'];
-            const needsProxy = this.settings.forceProxy || proxyRequiredDomains.some(domain => streamUrl.includes(domain));
+            const isMixedContent = window.location.protocol === 'https:' && streamUrl.startsWith('http://');
+            const needsProxy = this.settings.forceProxy || isMixedContent || isSafariNative ||
+                proxyRequiredDomains.some(domain => streamUrl.includes(domain));
 
             this.isUsingProxy = needsProxy;
             const finalUrl = needsProxy ? this.getProxiedUrl(streamUrl) : streamUrl;
@@ -1080,14 +1634,38 @@ class VideoPlayer {
                 return;
             }
 
-            // Priority 1: Use HLS.js for HLS streams on browsers that support it
-            if (looksLikeHls && Hls.isSupported()) {
+            // Priority 1: Native HLS support - gated to genuine Safari/WebKit
+            // specifically (isSafariNative, computed above alongside the proxy
+            // decision - detected the same reliable way as the AirPlay button
+            // below: presence of webkitShowPlaybackTargetPicker), NOT just
+            // video.canPlayType('application/vnd.apple.mpegurl'). canPlayType
+            // is a heuristic that can return a false "maybe" on some Chromium
+            // builds too - when that happened, native playback was attempted
+            // on a browser with no real HLS demuxer, and any stream needing
+            // the CORS-proxy fallback would just spin forever (the proxy
+            // served data fine per server logs, but native HLS parsing is far
+            // stricter about manifest quirks than hls.js and never rendered
+            // it). Checked before HLS.js even though HLS.js/MediaSource also
+            // "works" on real Safari - a MediaSource-backed <video> has no
+            // independent URL for AirPlay's receiver (Apple TV) to fetch and
+            // decode on its own, so AirPlay silently falls back to audio-only
+            // when Safari is routed through HLS.js instead of its own native
+            // engine. Native playback gives it a real src the Apple TV can
+            // pull from directly. Backed by startNativeStallWatch() below in
+            // case this specific stream still hits the redirect/token or
+            // concurrency issue the proxy (now always used here - see above)
+            // is meant to prevent.
+            const startDirectHlsJs = () => {
+                // Priority 2: HLS.js - either as the primary path for
+                // browsers without native HLS support (Chrome, Firefox,
+                // etc.), or as the automatic fallback when native playback
+                // stalled above.
                 this.updateTranscodeStatus('direct', 'Direct HLS');
-
-                // Use playHls helper logic here (or extract it)
-                // For now, let's just use existing logic but wrapped/modularized if possible?
-                // The HLS init logic is quite complex with error handling
-                // I'll inline the Hls init here as per original but mindful of proxy vs local
+                if (this.hls) {
+                    this.hls.destroy();
+                    this.hls = null;
+                }
+                this.video.src = '';
 
                 this.hls = new Hls(this.getHlsConfig());
                 this.hls.loadSource(finalUrl);
@@ -1143,9 +1721,9 @@ class VideoPlayer {
                         }
                     }
                 });
-            } else if (this.video.canPlayType('application/vnd.apple.mpegurl') === 'probably' ||
-                this.video.canPlayType('application/vnd.apple.mpegurl') === 'maybe') {
-                // Priority 2: Native HLS support (Safari on iOS/macOS where HLS.js may not work)
+            };
+
+            if (looksLikeHls && isSafariNative) {
                 this.updateTranscodeStatus('direct', 'Direct Native');
                 this.video.src = finalUrl;
                 this.video.play().catch(e => {
@@ -1159,6 +1737,9 @@ class VideoPlayer {
                         });
                     }
                 });
+                this.startNativeStallWatch(finalUrl, startDirectHlsJs);
+            } else if (looksLikeHls && Hls.isSupported()) {
+                startDirectHlsJs();
             } else {
                 // Priority 3: Try direct playback for non-HLS streams
                 this.updateTranscodeStatus('direct', 'Direct Play');
@@ -1188,11 +1769,58 @@ class VideoPlayer {
 
     /**
      * Helper to play HLS stream (reduces duplication)
+     *
+     * Previously this always went through HLS.js for transcode/remux session
+     * output, because native Safari HLS playback of our own locally-generated
+     * live playlists was once observed to load the first frame and then never
+     * poll for new segments. That symptom, on investigation, matches exactly
+     * what happens when the FFmpeg session feeding the playlist silently dies
+     * upstream (this provider's live source redirects to a short-lived,
+     * token-bearing CDN URL - see the matching comment on the session's own
+     * input handling in transcodeSession.js) - the last segment plays out and
+     * there's nothing new to fetch, which looks identical to a native-HLS bug
+     * but isn't one. Now that FFmpeg's input is proxied to survive that,
+     * native playback is worth trying again for the AirPlay it enables (a
+     * real network src the AirPlay receiver can pull directly, instead of the
+     * audio-only fallback MediaSource-backed video gets - see the AirPlay
+     * button comment in initCustomControls). startNativeStallWatch still backs
+     * this up with an automatic fallback to HLS.js if a stall happens anyway,
+     * so this is strictly an improvement, not a gamble on the old bug being
+     * fully gone.
      */
     playHls(url) {
+        this.clearNativeStallWatch();
         if (this.hls) {
             this.hls.destroy();
+            this.hls = null;
         }
+
+        if (typeof this.video.webkitShowPlaybackTargetPicker === 'function' &&
+            (this.video.canPlayType('application/vnd.apple.mpegurl') === 'probably' ||
+                this.video.canPlayType('application/vnd.apple.mpegurl') === 'maybe')) {
+            this.video.src = url;
+            this.video.play().catch(e => {
+                if (e.name !== 'AbortError') console.log('Autoplay prevented:', e);
+            });
+            this.startNativeStallWatch(url, () => this.playHlsJs(url));
+            return;
+        }
+
+        this.playHlsJs(url);
+    }
+
+    /**
+     * HLS.js playback for a transcode/remux session URL - the always-works
+     * fallback playHls() uses on non-Safari browsers, or automatically if
+     * native playback above stalls.
+     */
+    playHlsJs(url) {
+        this.clearNativeStallWatch();
+        if (this.hls) {
+            this.hls.destroy();
+            this.hls = null;
+        }
+        this.video.src = '';
 
         this.hls = new Hls(this.getHlsConfig());
         this.hls.loadSource(url);
@@ -1211,6 +1839,50 @@ class VideoPlayer {
                 this.hls.destroy();
             }
         });
+    }
+
+    /**
+     * Watches native <video> HLS playback for the specific "loads the first
+     * frame and never advances" stall (see playHls()'s comment for the two
+     * known causes) and calls onStall() once if it's detected, so playback
+     * recovers via HLS.js instead of sitting frozen indefinitely. No-ops once
+     * a newer call to startNativeStallWatch/clearNativeStallWatch supersedes
+     * this one (channel change, stop, or the HLS.js fallback itself starting).
+     */
+    startNativeStallWatch(url, onStall) {
+        this.clearNativeStallWatch();
+        this._nativeStallUrl = url;
+        let lastTime = -1;
+        let stuckStreak = 0;
+        this._nativeStallInterval = setInterval(() => {
+            if (this._nativeStallUrl !== url) {
+                this.clearNativeStallWatch();
+                return;
+            }
+            if (this.video.paused || this.video.seeking) return;
+            if (this.video.currentTime === lastTime) {
+                stuckStreak++;
+            } else {
+                stuckStreak = 0;
+                lastTime = this.video.currentTime;
+            }
+            // ~9s (3 checks) of zero progress while "playing" - long enough to
+            // not false-positive on normal buffering, short enough that the
+            // fallback still feels responsive.
+            if (stuckStreak >= 3) {
+                console.warn('[Player] Native HLS stalled, falling back to HLS.js:', url);
+                this.clearNativeStallWatch();
+                onStall();
+            }
+        }, 3000);
+    }
+
+    clearNativeStallWatch() {
+        if (this._nativeStallInterval) {
+            clearInterval(this._nativeStallInterval);
+            this._nativeStallInterval = null;
+        }
+        this._nativeStallUrl = null;
     }
 
     async updateTranscodeStatus(mode, text) {
@@ -1387,14 +2059,25 @@ class VideoPlayer {
     /**
      * Stop playback
      */
-    stop() {
-        // Stop any running transcode session first
-        this.stopTranscodeSession();
+    async stop() {
+        // Stop any running transcode session first. Awaited (not
+        // fire-and-forget) so callers that themselves await stop() - notably
+        // play(), when switching quality on an already-playing channel - can
+        // be sure the old session's release has at least been acknowledged
+        // by the server before starting a new one against the same
+        // one-connection-at-a-time provider. Existing callers that don't
+        // await stop() are unaffected (a promise nobody awaits just resolves
+        // in the background, same as before).
+        await this.stopTranscodeSession();
+
+        // Shared navbar pill
+        window.app?.clearNowPlaying();
 
         if (this.hls) {
             this.hls.destroy();
             this.hls = null;
         }
+        this.clearNativeStallWatch();
         this.video.pause();
         this.video.src = '';
         this.video.load();
@@ -1554,16 +2237,6 @@ class VideoPlayer {
         window.app.channelList.selectChannel({ channelId: channels[nextIdx].id });
     }
 
-    /**
-     * Toggle fullscreen
-     */
-    toggleFullscreen() {
-        if (document.fullscreenElement) {
-            document.exitFullscreen();
-        } else if (this.container) {
-            this.container.requestFullscreen();
-        }
-    }
 }
 
 // Export

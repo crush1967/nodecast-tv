@@ -767,7 +767,19 @@ class ChannelList {
             ]);
             this.render();
         } catch (err) {
+            // Previously logged-only: a single transient fetch failure (far more
+            // likely over Tailscale/cellular than local WiFi) left this.channels
+            // empty and the container stuck showing the loading spinner forever,
+            // with nothing telling the user why the channel list was empty.
             console.error('Error loading all channels:', err);
+            this.container.innerHTML = `
+                <div class="empty-state">
+                    <p>Error loading channels</p>
+                    <p class="hint">${this.escapeHtml(err.message)}</p>
+                    <button type="button" class="btn btn-sm" id="channel-list-retry-btn">Retry</button>
+                </div>
+            `;
+            document.getElementById('channel-list-retry-btn')?.addEventListener('click', () => this.loadAllChannels());
         }
     }
 

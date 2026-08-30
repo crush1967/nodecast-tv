@@ -110,6 +110,7 @@ function initSchema() {
             source_id INTEGER NOT NULL,
             item_id TEXT NOT NULL,
             item_type TEXT NOT NULL, -- 'channel', 'movie', 'series'
+            sort_order INTEGER NOT NULL DEFAULT 0, -- manual ordering within (user_id, item_type)
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_id, source_id, item_id, item_type)
         );
@@ -143,6 +144,16 @@ function initSchema() {
         // Column already exists, ignore
     }
 
+    // Migration: Add sort_order to favorites if missing (for existing databases) -
+    // backfill using id (roughly creation order) so nothing reshuffles on upgrade.
+    try {
+        db.exec(`ALTER TABLE favorites ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`);
+        db.exec(`UPDATE favorites SET sort_order = id`);
+        console.log('[SQLite] Added sort_order column to favorites');
+    } catch (e) {
+        // Column already exists, ignore
+    }
+
     console.log('[SQLite] Schema initialized');
 }
 
@@ -164,18 +175,52 @@ const favorites = {
             params.push(itemType);
         }
 
-        sql += ' ORDER BY created_at DESC';
+        sql += ' ORDER BY sort_order ASC, created_at ASC';
         return db.prepare(sql).all(...params);
     },
 
     add(userId, sourceId, itemId, itemType = 'channel') {
         const db = getDb();
+        // New favorites append to the end of this user's list for that item type.
+        const maxOrder = db.prepare(
+            'SELECT COALESCE(MAX(sort_order), 0) AS maxOrder FROM favorites WHERE user_id = ? AND item_type = ?'
+        ).get(userId, itemType).maxOrder;
         const stmt = db.prepare(`
-            INSERT OR IGNORE INTO favorites (user_id, source_id, item_id, item_type)
-            VALUES (?, ?, ?, ?)
+            INSERT OR IGNORE INTO favorites (user_id, source_id, item_id, item_type, sort_order)
+            VALUES (?, ?, ?, ?, ?)
         `);
-        const result = stmt.run(userId, sourceId, itemId, itemType);
+        const result = stmt.run(userId, sourceId, itemId, itemType, maxOrder + 1);
         return result.changes > 0;
+    },
+
+    /**
+     * Swap a favorite's position with its immediate neighbor (previous or next
+     * by sort_order, scoped to the same user + item_type). Returns false if
+     * already at that end of the list - nothing to swap with.
+     */
+    move(userId, favoriteId, direction) {
+        const db = getDb();
+        const current = db.prepare('SELECT * FROM favorites WHERE id = ? AND user_id = ?').get(favoriteId, userId);
+        if (!current) return false;
+
+        const neighbor = direction === 'up'
+            ? db.prepare(`
+                SELECT * FROM favorites WHERE user_id = ? AND item_type = ? AND sort_order < ?
+                ORDER BY sort_order DESC LIMIT 1
+            `).get(userId, current.item_type, current.sort_order)
+            : db.prepare(`
+                SELECT * FROM favorites WHERE user_id = ? AND item_type = ? AND sort_order > ?
+                ORDER BY sort_order ASC LIMIT 1
+            `).get(userId, current.item_type, current.sort_order);
+
+        if (!neighbor) return false;
+
+        const swap = db.transaction(() => {
+            db.prepare('UPDATE favorites SET sort_order = ? WHERE id = ?').run(neighbor.sort_order, current.id);
+            db.prepare('UPDATE favorites SET sort_order = ? WHERE id = ?').run(current.sort_order, neighbor.id);
+        });
+        swap();
+        return true;
     },
 
     remove(userId, sourceId, itemId, itemType = 'channel') {

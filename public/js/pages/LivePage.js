@@ -99,6 +99,19 @@ class LivePage {
             await this.app.channelList.loadSources();
             await this.app.channelList.loadChannels();
         }
+
+        // A channel that was playing when this page was hidden can end up
+        // force-stopped in the background (most commonly iOS Safari
+        // suspending/erroring a MediaSource-backed <video> while its page is
+        // display:none) - VideoPlayer.stop() resets playback and shows the
+        // "select a channel" overlay but deliberately leaves currentChannel
+        // set, so that state is exactly what's needed to silently resume the
+        // same channel here instead of stranding the user on the empty
+        // placeholder with no way back to what they were watching.
+        const player = this.app.player;
+        if (player?.currentChannel && !player.overlay.classList.contains('hidden')) {
+            await this.app.channelList.selectChannel({ channelId: player.currentChannel.id });
+        }
     }
 
     hide() {

@@ -1,6 +1,7 @@
 const express = require('express');
 require('dotenv').config();
 const path = require('path');
+const https = require('https');
 const passport = require('passport');
 const syncService = require('./services/syncService');
 
@@ -9,6 +10,7 @@ require('./db');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const HTTPS_PORT = process.env.HTTPS_PORT || 3443;
 
 // Trust proxy headers (X-Forwarded-Proto, X-Forwarded-For, etc.)
 // Required for correct protocol detection behind reverse proxies (nginx, Caddy, etc.)
@@ -27,7 +29,18 @@ app.use(session({
 app.use(passport.initialize());
 app.use(passport.session());
 
-app.use(express.static(path.join(__dirname, '..', 'public')));
+app.use(express.static(path.join(__dirname, '..', 'public'), {
+    setHeaders: (res, filePath) => {
+        // Without this, browsers can serve JS/CSS/HTML straight from disk
+        // cache on a normal refresh without even asking the server if it
+        // changed - only a hard refresh reliably picks up new deploys. This
+        // forces a cheap revalidation check (ETag/Last-Modified) on every
+        // load, so a normal refresh is always enough going forward.
+        if (/\.(js|css|html)$/.test(filePath)) {
+            res.setHeader('Cache-Control', 'no-cache');
+        }
+    }
+}));
 
 // FFMPEG Configuration (optional - for transcoding support)
 // Priority: 1. System FFmpeg (better Docker DNS support), 2. ffmpeg-static npm package
@@ -180,6 +193,8 @@ app.use('/api/probe', require('./routes/probe'));
 app.use('/api/subtitle', require('./routes/subtitle'));
 app.use('/api/settings', require('./routes/settings'));
 app.use('/api/history', require('./routes/history'));
+app.use('/api/recordings', require('./routes/recordings'));
+app.use('/api/schedules', require('./routes/schedules'));
 
 // Version endpoint
 app.get('/api/version', (req, res) => {
@@ -201,6 +216,17 @@ app.use((err, req, res, next) => {
 app.listen(PORT, async () => {
     console.log(`NodeCast TV server running on http://localhost:${PORT}`);
 
+    // Start the scheduled-recording checker immediately, independent of the
+    // (potentially slow) EPG sync below - a schedule due right now shouldn't
+    // have to wait on that.
+    require('./services/scheduler').startScheduler(app);
+
+    // Disk-space failsafe for recordings - also independent of the sync delay.
+    require('./services/diskGuard').startDiskGuard(async () => {
+        const settings = await require('./db').settings.get();
+        return settings.minFreeDiskSpaceGB || 5;
+    });
+
     // Load plugins
     await loadPlugins().catch(err => {
         console.error('Plugin initialization failed:', err);
@@ -221,3 +247,26 @@ app.listen(PORT, async () => {
         }
     }, 5000);
 });
+
+// Optional HTTPS listener using a Tailscale-issued cert (see `tailscale cert`).
+// Shares the same Express app/routes as the HTTP listener above - this is
+// purely an additional entry point for a real, trusted padlock over the
+// tailnet (and protection against local-network snooping), not a replacement
+// for plain HTTP, which stays available for localhost/LAN convenience.
+// Silently skipped if no cert has been issued yet (certs/ is gitignored,
+// nothing to commit or configure for setups that don't use this).
+const certDir = path.join(__dirname, '..', 'certs');
+if (fs.existsSync(certDir)) {
+    const certFile = fs.readdirSync(certDir).find(f => f.endsWith('.crt'));
+    const keyFile = fs.readdirSync(certDir).find(f => f.endsWith('.key'));
+    if (certFile && keyFile) {
+        const httpsOptions = {
+            cert: fs.readFileSync(path.join(certDir, certFile)),
+            key: fs.readFileSync(path.join(certDir, keyFile))
+        };
+        https.createServer(httpsOptions, app).listen(HTTPS_PORT, () => {
+            const portSuffix = HTTPS_PORT === 443 ? '' : `:${HTTPS_PORT}`;
+            console.log(`NodeCast TV server also running on https://${certFile.replace('.crt', '')}${portSuffix}`);
+        });
+    }
+}

@@ -10,7 +10,7 @@
   <title>nodecast-tv | IPTV Player</title>
   <meta name="description" content="Stream live TV, movies, and series with EPG support">
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-  <link rel="stylesheet" href="css/main.css">
+  <link rel="stylesheet" href="css/main.css?v=11">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@800&display=swap"
@@ -38,11 +38,20 @@
         <span></span>
       </button>
       <div class="navbar-menu" id="navbar-menu">
-        <!-- Now Playing indicator for movies/series -->
-        <a href="#" class="now-playing-indicator hidden" id="now-playing-indicator" data-page="watch">
-          <span class="now-playing-icon">▶</span>
-          <span class="now-playing-text" id="now-playing-text">Now Playing</span>
-        </a>
+        <!-- Now Playing indicator - shown whenever Live TV or a movie/series is
+             active anywhere in the app (including navigated away from), since
+             only one stream can be active at a time on most IPTV plans. The
+             stop button lets it be released from any page without first
+             navigating back to the player. -->
+        <div class="now-playing-indicator hidden" id="now-playing-indicator">
+          <a href="#" class="now-playing-link" id="now-playing-link" data-page="watch">
+            <span class="now-playing-icon">▶</span>
+            <span class="now-playing-text" id="now-playing-text">Now Playing</span>
+          </a>
+          <button class="now-playing-stop" id="now-playing-stop" title="Stop">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h12v12H6z"/></svg>
+          </button>
+        </div>
         <a href="#" class="nav-link active" data-page="home">
           <span class="nav-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"
               class="icon">
@@ -80,6 +89,13 @@
                 d="M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h5v2h8v-2h5c1.1 0 1.99-.9 1.99-2L23 5c0-1.1-.9-2-2-2zm0 14H3V5h18v12z" />
             </svg></span>
           <span>Series</span>
+        </a>
+        <a href="#" class="nav-link" data-page="recordings">
+          <span class="nav-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"
+              class="icon">
+              <circle cx="12" cy="12" r="8" />
+            </svg></span>
+          <span>Recordings</span>
         </a>
         <a href="#" class="nav-link" data-page="settings">
           <span class="nav-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"
@@ -170,6 +186,10 @@
                   <div class="player-badges">
                     <div class="transcode-status hidden" id="player-transcode-status">Direct</div>
                     <div class="quality-badge hidden" id="player-quality-badge"></div>
+                    <div class="recording-badge hidden" id="player-recording-badge">
+                      <span class="recording-dot"></span>
+                      <span id="player-recording-time">REC</span>
+                    </div>
                   </div>
                 </div>
 
@@ -252,12 +272,42 @@
                         </svg>
                       </button>
                       <div class="player-overflow-menu hidden" id="player-overflow-menu">
+                        <button class="overflow-menu-item" id="btn-record">
+                          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="icon">
+                            <circle cx="12" cy="12" r="8" />
+                          </svg>
+                          <span id="btn-record-label">Record</span>
+                        </button>
+                        <div class="record-duration-panel hidden" id="record-duration-panel">
+                          <input type="number" id="record-duration-input" min="1" step="1"
+                            placeholder="Minutes (blank = manual stop)">
+                          <button class="overflow-menu-item record-start-btn" id="btn-record-confirm">Start Recording</button>
+                        </div>
                         <button class="overflow-menu-item" id="btn-copy-url">
                           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="icon">
                             <path
                               d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z" />
                           </svg>
                           Copy Stream URL
+                        </button>
+                        <button class="overflow-menu-item" id="btn-low-bitrate" title="Re-encode at a lower bitrate if this channel keeps buffering">
+                          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="icon">
+                            <path d="M3 18h4v-4H3v4zm6 0h4V6H9v12zm6 0h4v-8h-4v8z" />
+                          </svg>
+                          <span id="btn-low-bitrate-label">Lower Quality (Reduce Buffering)</span>
+                        </button>
+                        <button class="overflow-menu-item hidden" id="btn-airplay">
+                          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="icon">
+                            <path
+                              d="M6 22h12l-6-6zM21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h4v-2H3V5h18v12h-4v2h4c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z" />
+                          </svg>
+                          AirPlay
+                        </button>
+                        <button class="overflow-menu-item" id="btn-stop-channel">
+                          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="icon">
+                            <path d="M6 6h12v12H6z" />
+                          </svg>
+                          Stop
                         </button>
                       </div>
                     </div>
@@ -385,6 +435,11 @@
             <div id="series-seasons" class="series-seasons"></div>
           </div>
         </div>
+      </div>
+
+      <!-- Recordings Page -->
+      <div id="page-recordings" class="page">
+        <div class="loading-state">Loading Recordings...</div>
       </div>
 
       <!-- Settings Page -->
@@ -639,6 +694,18 @@
                   <span class="setting-label">Auto Transcode (Smart)</span>
                   <span class="setting-hint">Automatically detect stream codecs and only transcode/remux when needed.
                     Adds ~1-3s probe delay on first play.</span>
+                </div>
+              </div>
+              <div class="setting-item">
+                <label class="setting-toggle">
+                  <input type="checkbox" id="setting-reliable-streaming-tc">
+                  <span class="toggle-slider"></span>
+                </label>
+                <div class="setting-info">
+                  <span class="setting-label">Reliable Streaming (Server Buffer)</span>
+                  <span class="setting-hint">Have the server hold the connection to your provider and stream to you
+                    from its own local copy instead of your browser reading the provider directly. Absorbs network
+                    hiccups before they become a visible pause, at the cost of a few extra seconds behind live.</span>
                 </div>
               </div>
               <div class="setting-item">
@@ -934,6 +1001,19 @@
                       </svg>
                       Copy Stream URL
                     </button>
+                    <button class="overflow-menu-item hidden" id="watch-airplay">
+                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="icon">
+                        <path
+                          d="M6 22h12l-6-6zM21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h4v-2H3V5h18v12h-4v2h4c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z" />
+                      </svg>
+                      AirPlay
+                    </button>
+                    <button class="overflow-menu-item" id="watch-stop-btn">
+                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="icon">
+                        <path d="M6 6h12v12H6z" />
+                      </svg>
+                      Stop
+                    </button>
                   </div>
                 </div>
               </div>
@@ -1096,19 +1176,20 @@
 
   <!-- JavaScript -->
   <script src="/js/icons.js"></script>
-  <script src="/js/api.js?v=2"></script>
-  <script src="/js/components/VideoPlayer.js?v=2"></script>
-  <script src="/js/components/ChannelList.js?v=3"></script>
+  <script src="/js/api.js?v=3"></script>
+  <script src="/js/components/VideoPlayer.js?v=33"></script>
+  <script src="/js/components/ChannelList.js?v=4"></script>
   <script src="/js/components/SourceManager.js?v=2"></script>
   <script src="/js/components/EpgGuide.js?v=2"></script>
-  <script src="/js/pages/HomePage.js?v=2"></script>
-  <script src="/js/pages/LivePage.js?v=2"></script>
+  <script src="/js/pages/HomePage.js?v=3"></script>
+  <script src="/js/pages/LivePage.js?v=3"></script>
   <script src="/js/pages/Guide.js?v=2"></script>
   <script src="/js/pages/MoviesPage.js?v=4"></script>
   <script src="/js/pages/SeriesPage.js?v=1"></script>
-  <script src="/js/pages/Settings.js?v=2"></script>
-  <script src="/js/pages/WatchPage.js?v=1"></script>
-  <script src="/js/app.js?v=4"></script>
+  <script src="/js/pages/Settings.js?v=3"></script>
+  <script src="/js/pages/WatchPage.js?v=13"></script>
+  <script src="/js/pages/RecordingsPage.js?v=13"></script>
+  <script src="/js/app.js?v=6"></script>
   <script>
     // Check for SSO token in URL
     (function () {
