@@ -313,6 +313,30 @@ h4 {
   display: block;
 }
 
+/* Live TV and Watch hold the actual <video> element. iOS/WebKit ends an
+   active AirPlay session outright the moment its source element (or an
+   ancestor) goes display:none - not paused, ended - so unlike every other
+   page, these two can't use the plain display:none toggle without silently
+   killing AirPlay on every navigation away. Kept technically "visible"
+   (non-zero size, not display:none/visibility:hidden) but pushed off-screen
+   and non-interactive instead, which keeps WebKit treating the video as
+   live - matching what the "Now Playing" pill already implies: playback
+   continuing while you browse other pages. Wins over the plain .page rule
+   above via the ID selector's higher specificity.
+   Note: this makes the ID intentional, not just a hook - if #page-live or
+   #page-watch is ever renamed, update this selector too. */
+#page-live:not(.active),
+#page-watch:not(.active) {
+  display: block;
+  position: fixed;
+  top: 0;
+  left: -9999px;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  pointer-events: none;
+}
+
 /* Empty State */
 .empty-state {
   display: flex;

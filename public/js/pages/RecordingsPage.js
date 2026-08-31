@@ -212,6 +212,24 @@ class RecordingsPage {
         `;
     }
 
+    /** Watch button, shared by the Recording Now and Recorded lists - the
+     * stream endpoint transparently serves the live-growing part file(s)
+     * while a recording is still active, so this works identically either
+     * way with no extra state needed here. */
+    wireWatchButtons(root) {
+        root.querySelectorAll('.btn-watch-recording').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const streamUrl = API.recordings.getStreamUrl(btn.dataset.id);
+                window.app.pages.watch.play({
+                    type: 'recording',
+                    title: btn.dataset.channel || 'Recording',
+                    subtitle: new Date(btn.dataset.started).toLocaleString(),
+                    containerExtension: 'ts'
+                }, streamUrl);
+            });
+        });
+    }
+
     wireExtendButtons(root) {
         root.querySelectorAll('.btn-extend').forEach(btn => {
             btn.addEventListener('click', async () => {
@@ -254,6 +272,7 @@ class RecordingsPage {
                     ${this.estimateFinalSizeLabel(r)}
                 `,
                 actionsHtml: `
+                    <button class="btn-primary btn-watch-recording" data-id="${r.id}" data-channel="${this.escapeHtml(r.channelName || '')}" data-started="${r.startedAt}">Watch</button>
                     ${schedule ? this.buildExtendButtons(schedule.id) : ''}
                     <button class="btn-secondary btn-stop-recording" data-id="${r.id}">Stop</button>
                 `
@@ -268,6 +287,7 @@ class RecordingsPage {
         `;
 
         this.wireExtendButtons(section);
+        this.wireWatchButtons(section);
 
         section.querySelectorAll('.btn-stop-recording').forEach(btn => {
             btn.addEventListener('click', async () => {
@@ -372,17 +392,7 @@ class RecordingsPage {
             <div class="recordings-list">${rows}</div>
         `;
 
-        section.querySelectorAll('.btn-watch-recording').forEach(btn => {
-            btn.addEventListener('click', () => {
-                const streamUrl = API.recordings.getStreamUrl(btn.dataset.id);
-                window.app.pages.watch.play({
-                    type: 'recording',
-                    title: btn.dataset.channel || 'Recording',
-                    subtitle: new Date(btn.dataset.started).toLocaleString(),
-                    containerExtension: 'ts'
-                }, streamUrl);
-            });
-        });
+        this.wireWatchButtons(section);
 
         section.querySelectorAll('.btn-delete-recording').forEach(btn => {
             btn.addEventListener('click', async () => {

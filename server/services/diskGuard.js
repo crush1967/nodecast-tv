@@ -90,18 +90,31 @@ async function checkRecordingSizes() {
         const session = recordingSession.getSessionByDbId(entry.id);
         if (!session) continue;
 
-        let stat;
-        try {
-            stat = await fs.promises.stat(session.filePath);
-        } catch {
-            continue; // File not written yet, nothing to check
+        // While actively recording, the data lives in part files (see
+        // RecordingSession - a mid-recording restart after a connection drop
+        // writes a new part rather than resuming session.filePath directly),
+        // which only gets joined together once the recording actually stops.
+        // Summing every part's current size gives the true total written so
+        // far either way.
+        const parts = session.parts && session.parts.length ? session.parts : [session.filePath];
+        let totalSize = 0;
+        let anyFound = false;
+        for (const partPath of parts) {
+            try {
+                const partStat = await fs.promises.stat(partPath);
+                totalSize += partStat.size;
+                anyFound = true;
+            } catch {
+                // This part not written yet (or already joined/removed) - skip it.
+            }
         }
+        if (!anyFound) continue; // Nothing written yet, nothing to check
 
         const elapsedSeconds = (Date.now() - session.startedAt) / 1000;
         const maxExpectedBytes = elapsedSeconds * MAX_BYTES_PER_SECOND;
 
-        if (stat.size > maxExpectedBytes) {
-            const actualMbps = ((stat.size * 8) / elapsedSeconds / 1e6).toFixed(1);
+        if (totalSize > maxExpectedBytes) {
+            const actualMbps = ((totalSize * 8) / elapsedSeconds / 1e6).toFixed(1);
             console.error(
                 `[DiskGuard] Recording ${entry.id} ("${entry.channelName}") is growing abnormally fast ` +
                 `(~${actualMbps} Mbps, expected under 25) - stopping it.`

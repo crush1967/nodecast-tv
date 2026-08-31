@@ -10,7 +10,7 @@
   <title>nodecast-tv | IPTV Player</title>
   <meta name="description" content="Stream live TV, movies, and series with EPG support">
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-  <link rel="stylesheet" href="css/main.css?v=11">
+  <link rel="stylesheet" href="css/main.css?v=12">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@800&display=swap"
@@ -186,6 +186,7 @@
                   <div class="player-badges">
                     <div class="transcode-status hidden" id="player-transcode-status">Direct</div>
                     <div class="quality-badge hidden" id="player-quality-badge"></div>
+                    <div class="quality-badge hidden" id="player-engine-badge"></div>
                     <div class="recording-badge hidden" id="player-recording-badge">
                       <span class="recording-dot"></span>
                       <span id="player-recording-time">REC</span>
@@ -902,6 +903,7 @@
               <div class="player-badges">
                 <div class="transcode-status hidden" id="watch-transcode-status">Direct</div>
                 <div class="quality-badge hidden" id="watch-quality-badge"></div>
+                <div class="quality-badge hidden" id="watch-engine-badge"></div>
               </div>
             </div>
 
@@ -1177,7 +1179,7 @@
   <!-- JavaScript -->
   <script src="/js/icons.js"></script>
   <script src="/js/api.js?v=3"></script>
-  <script src="/js/components/VideoPlayer.js?v=33"></script>
+  <script src="/js/components/VideoPlayer.js?v=44"></script>
   <script src="/js/components/ChannelList.js?v=4"></script>
   <script src="/js/components/SourceManager.js?v=2"></script>
   <script src="/js/components/EpgGuide.js?v=2"></script>
@@ -1187,9 +1189,9 @@
   <script src="/js/pages/MoviesPage.js?v=4"></script>
   <script src="/js/pages/SeriesPage.js?v=1"></script>
   <script src="/js/pages/Settings.js?v=3"></script>
-  <script src="/js/pages/WatchPage.js?v=13"></script>
-  <script src="/js/pages/RecordingsPage.js?v=13"></script>
-  <script src="/js/app.js?v=6"></script>
+  <script src="/js/pages/WatchPage.js?v=20"></script>
+  <script src="/js/pages/RecordingsPage.js?v=14"></script>
+  <script src="/js/app.js?v=7"></script>
   <script>
     // Check for SSO token in URL
     (function () {

@@ -125,10 +125,14 @@ class App {
             this.navigateTo(nowPlayingLink.dataset.page || 'watch');
         });
 
-        document.getElementById('now-playing-stop')?.addEventListener('click', (e) => {
+        document.getElementById('now-playing-stop')?.addEventListener('click', async (e) => {
             e.preventDefault();
             e.stopPropagation();
-            this.nowPlayingStopFn?.();
+            // Awaited - same fix as the Live TV overflow menu's Stop button:
+            // firing this without waiting let a quick next channel/title
+            // selection start before the old session had genuinely finished
+            // releasing server-side.
+            await this.nowPlayingStopFn?.();
         });
 
         // Toggle groups button

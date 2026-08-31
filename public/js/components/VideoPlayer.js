@@ -315,15 +315,25 @@ class VideoPlayer {
         });
 
         this.video.addEventListener('canplay', () => {
-            this.loadingSpinner?.classList.remove('show');
-            // Also refresh play/pause UI here, not just on 'play'/'pause' -
-            // canplay fires once there's decodable data regardless of whether
-            // a play() call actually succeeded, so this is the one place
+            // Deliberately NOT hiding the loading spinner here anymore -
+            // canplay only means the browser could technically start
+            // playing, not that it actually is. Hiding the spinner at this
+            // point left a real gap: spinner gone, but the video area still
+            // black because rendering hasn't actually begun, which looks
+            // exactly like the app died instead of like it's still loading.
+            // 'playing' below (genuine playback start) is the correct signal
+            // for that. Still refreshing play/pause UI here though - canplay
+            // fires once there's decodable data regardless of whether a
+            // play() call actually succeeded, so this is the one place
             // guaranteed to catch a silently-rejected autoplay (no 'play' or
             // 'pause' event fires for that, since the video never actually
             // changes state) and show the center play button so there's a
             // way to manually resume instead of a frozen, unrecoverable video.
             this.updatePlayUI?.();
+        });
+
+        this.video.addEventListener('playing', () => {
+            this.loadingSpinner?.classList.remove('show');
         });
 
         // Mute/Volume
@@ -432,11 +442,19 @@ class VideoPlayer {
         // when you come back to Live TV (that resume is intentional recovery
         // from a background-stop, not meant to fight an explicit Stop click).
         const btnStopChannel = document.getElementById('btn-stop-channel');
-        btnStopChannel?.addEventListener('click', (e) => {
+        btnStopChannel?.addEventListener('click', async (e) => {
             e.stopPropagation();
-            this.currentChannel = null;
-            this.stop();
             overflowMenu?.classList.add('hidden');
+            // Awaited, and currentChannel cleared only after stop() actually
+            // finishes - previously this fired stop() without waiting and
+            // nulled currentChannel immediately, so a quick channel pick
+            // right after Stop could start playing before the old session
+            // had genuinely released server-side (this.currentChannel being
+            // already null also defeated play()'s own "was I already on a
+            // channel" check meant to add a protective pause for exactly
+            // this kind of switch).
+            await this.stop();
+            this.currentChannel = null;
         });
 
         // Lower Quality - manual retry at a capped bitrate/resolution when a
@@ -581,7 +599,7 @@ class VideoPlayer {
         });
 
         // Initial state
-        updatePlayUI();
+        this.updatePlayUI();
         updateVolumeUI();
     }
 
@@ -1233,6 +1251,11 @@ class VideoPlayer {
      * Play a channel
      */
     async play(channel, streamUrl) {
+        // Captured before being overwritten below - whether we were already
+        // actively on a different channel, regardless of whether that
+        // playback happened to be using a tracked TranscodeSession (compatible
+        // channels play directly/via HLS.js with no session at all).
+        const wasSwitchingChannel = !!this.currentChannel && this.currentChannel.id !== channel?.id;
         this.currentChannel = channel;
         // Captured once, checked after every await below - if a newer play()
         // call has started by the time an awaited step resolves, this call
@@ -1256,6 +1279,21 @@ class VideoPlayer {
             // one-connection-at-a-time source (see stop()'s own comment).
             await this.stop();
             if (!stillCurrent()) return; // superseded while the old session was stopping
+
+            // Our own process being fully dead doesn't mean the provider's
+            // own side has recognized the connection as released yet -
+            // confirmed directly: switching BBC2 -> BBC1 immediately after
+            // our session finished tearing down still got the new channel a
+            // probe timeout and a failed session start, right at that exact
+            // boundary. A brief pause here gives the provider a moment to
+            // actually free the slot before we ask for a new one. Skipped
+            // when there was nothing to switch away from, so the very first
+            // channel selection isn't needlessly slower.
+            if (wasSwitchingChannel) {
+                await new Promise(resolve => setTimeout(resolve, 1500));
+                if (!stillCurrent()) return;
+            }
+
             this.updateTranscodeStatus('hidden');
 
             // Shared navbar pill - lets the connection be released from any
@@ -1550,9 +1588,13 @@ class VideoPlayer {
             // is unreliable). Needed here, before the proxy decision, because
             // native Safari/iOS needs the proxy for a reason that has nothing to
             // do with mixed content - see below.
-            const isSafariNative = typeof this.video.webkitShowPlaybackTargetPicker === 'function' &&
-                (this.video.canPlayType('application/vnd.apple.mpegurl') === 'probably' ||
-                    this.video.canPlayType('application/vnd.apple.mpegurl') === 'maybe');
+            // Forced false: native playback here was the one remaining
+            // unreliable path (spinner not showing, buffering) while
+            // WatchPage's HLS.js-only playback has been confirmed stable.
+            // Always using HLS.js here too - same known-good mechanism,
+            // Live TV only, WatchPage/Series untouched. Costs native AirPlay
+            // video for Live TV, same trade-off already accepted for Shows.
+            const isSafariNative = false;
 
             // Proactively use proxy for:
             // 1. User enabled "Force Proxy" in settings
@@ -1661,6 +1703,7 @@ class VideoPlayer {
                 // etc.), or as the automatic fallback when native playback
                 // stalled above.
                 this.updateTranscodeStatus('direct', 'Direct HLS');
+                this.updateEngineBadge('HLS.js');
                 if (this.hls) {
                     this.hls.destroy();
                     this.hls = null;
@@ -1725,6 +1768,7 @@ class VideoPlayer {
 
             if (looksLikeHls && isSafariNative) {
                 this.updateTranscodeStatus('direct', 'Direct Native');
+                this.updateEngineBadge('Native');
                 this.video.src = finalUrl;
                 this.video.play().catch(e => {
                     if (e.name === 'AbortError') return; // Ignore interruption by new load
@@ -1737,7 +1781,10 @@ class VideoPlayer {
                         });
                     }
                 });
-                this.startNativeStallWatch(finalUrl, startDirectHlsJs);
+                // No auto-fallback watch here (removed - see startNativeStallWatch's
+                // own comment for why): this exact branch was confirmed working
+                // reliably for Live TV before that machinery existed, and every
+                // attempt to tune its thresholds broke it again.
             } else if (looksLikeHls && Hls.isSupported()) {
                 startDirectHlsJs();
             } else {
@@ -1795,18 +1842,34 @@ class VideoPlayer {
             this.hls = null;
         }
 
-        if (typeof this.video.webkitShowPlaybackTargetPicker === 'function' &&
-            (this.video.canPlayType('application/vnd.apple.mpegurl') === 'probably' ||
-                this.video.canPlayType('application/vnd.apple.mpegurl') === 'maybe')) {
-            this.video.src = url;
-            this.video.play().catch(e => {
-                if (e.name !== 'AbortError') console.log('Autoplay prevented:', e);
-            });
-            this.startNativeStallWatch(url, () => this.playHlsJs(url));
-            return;
-        }
+        // Always HLS.js here - never native. This URL is always our own
+        // TranscodeSession output, and native playback of that has stalled on
+        // the first frame unpredictably even when the session was proven
+        // healthy server-side (segments actively being produced, client never
+        // even requesting them) - not something a stall-watch could safely
+        // catch without also breaking working playback elsewhere, tried and
+        // reverted twice today already. AirPlay is audio-only for this
+        // content as a result, same limitation as before native was tried
+        // here at all - the original direct-from-provider path below still
+        // uses native and still gives full AirPlay for anything that doesn't
+        // need transcoding.
 
         this.playHlsJs(url);
+    }
+
+    /**
+     * On-screen debug badge showing which engine is actually driving
+     * playback right now (Native vs HLS.js) - added because AirPlay video
+     * only works with Native, and repeated reports of "AirPlay is audio
+     * only" turned out impossible to diagnose blind (server-side logs can't
+     * tell which engine the client chose, or whether/when it fell back).
+     * Directly observable beats inferred from here on.
+     */
+    updateEngineBadge(engine) {
+        const el = document.getElementById('player-engine-badge');
+        if (!el) return;
+        el.textContent = engine;
+        el.classList.remove('hidden');
     }
 
     /**
@@ -1816,6 +1879,7 @@ class VideoPlayer {
      */
     playHlsJs(url) {
         this.clearNativeStallWatch();
+        this.updateEngineBadge('HLS.js');
         if (this.hls) {
             this.hls.destroy();
             this.hls = null;
@@ -1854,12 +1918,50 @@ class VideoPlayer {
         this._nativeStallUrl = url;
         let lastTime = -1;
         let stuckStreak = 0;
+        let hasStarted = false;
+        let neverStartedChecks = 0;
         this._nativeStallInterval = setInterval(() => {
             if (this._nativeStallUrl !== url) {
                 this.clearNativeStallWatch();
                 return;
             }
             if (this.video.paused || this.video.seeking) return;
+
+            if (!hasStarted) {
+                if (this.video.currentTime > 0) {
+                    hasStarted = true;
+                    lastTime = this.video.currentTime;
+                } else {
+                    // Still on the very first frame - this is normal startup
+                    // buffering, not a stall. A full software re-encode can
+                    // legitimately take close to the server's own 15s
+                    // session-start timeout before its first segment even
+                    // exists, so "hasn't started yet" gets a longer, separate
+                    // grace period before being treated as a stall itself -
+                    // otherwise this fires on ordinary slow-starting sessions
+                    // and silently loses native playback (and AirPlay video)
+                    // for exactly the content that most needs the time.
+                    neverStartedChecks++;
+                    if (neverStartedChecks >= 7) { // ~21s
+                        console.warn('[Player] Native HLS never started, falling back to HLS.js:', url);
+                        this.clearNativeStallWatch();
+                        onStall();
+                    }
+                }
+                return;
+            }
+
+            // Reverted: a videoWidth-based check lived here briefly, meant to
+            // catch audio-only playback (video decode failing while audio
+            // plays fine, which the currentTime check below can't see since
+            // audio keeps time advancing normally). Pulled after it broke
+            // Live TV, which was working before it was added - there's
+            // apparently a normal, brief window right after playback starts
+            // where videoWidth is legitimately still 0 before the first
+            // frame decodes, and 9s wasn't a safe threshold to distinguish
+            // that from a genuine failure. Not reintroducing this without a
+            // reliable way to tell the two apart.
+
             if (this.video.currentTime === lastTime) {
                 stuckStreak++;
             } else {

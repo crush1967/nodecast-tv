@@ -217,7 +217,15 @@ class WatchPage {
         this.video?.addEventListener('ended', () => this.onEnded());
         this.video?.addEventListener('error', (e) => this.onError(e));
         this.video?.addEventListener('waiting', () => this.showLoading());
-        this.video?.addEventListener('canplay', () => this.hideLoading());
+        // Deliberately NOT hiding the loading spinner on canplay - it only
+        // means the browser could technically start playing, not that it
+        // actually is. Hiding the spinner there left a real gap: spinner
+        // gone, but the video area still black because rendering hasn't
+        // actually begun, which looks exactly like the app died instead of
+        // like it's still loading. 'playing' below (genuine playback start)
+        // is the correct signal for that.
+        this.video?.addEventListener('canplay', () => this.checkStalledAutoplay());
+        this.video?.addEventListener('playing', () => this.hideLoading());
 
         // Overlay auto-hide + click to toggle play
         const watchSection = document.querySelector('.watch-video-section');
@@ -642,6 +650,7 @@ class WatchPage {
         } else {
             // Direct playback for mp4/mkv/avi
             this.updateTranscodeStatus('direct', 'Direct Play');
+            this.updateEngineBadge('Native');
             this.video.src = finalUrl;
             this.video.play().catch(e => {
                 if (e.name !== 'AbortError') console.error('[WatchPage] Autoplay error:', e);
@@ -676,18 +685,34 @@ class WatchPage {
             this.hls = null;
         }
 
-        if (typeof this.video.webkitShowPlaybackTargetPicker === 'function' &&
-            (this.video.canPlayType('application/vnd.apple.mpegurl') === 'probably' ||
-                this.video.canPlayType('application/vnd.apple.mpegurl') === 'maybe')) {
-            this.video.src = url;
-            this.video.play().catch(e => {
-                if (e.name !== 'AbortError') console.error('[WatchPage] Autoplay error:', e);
-            });
-            this.startNativeStallWatch(url, () => this.playHlsJs(url));
-            return;
-        }
+        // Always HLS.js here - never native. This URL is always our own
+        // TranscodeSession/remux output, and native playback of that has
+        // stalled on the first frame unpredictably even when the session was
+        // proven healthy server-side (segments actively being produced,
+        // client never even requesting them) - not something a stall-watch
+        // could safely catch without also breaking working playback
+        // elsewhere, tried and reverted twice today already. AirPlay is
+        // audio-only for this content as a result, same limitation as before
+        // native was tried here at all - the direct-play branch above still
+        // uses native and still gives full AirPlay for anything that doesn't
+        // need transcoding.
 
         this.playHlsJs(url);
+    }
+
+    /**
+     * On-screen debug badge showing which engine is actually driving
+     * playback right now (Native vs HLS.js) - added because AirPlay video
+     * only works with Native, and repeated reports of "AirPlay is audio
+     * only" turned out impossible to diagnose blind (server-side logs can't
+     * tell which engine the client chose, or whether/when it fell back).
+     * Directly observable beats inferred from here on.
+     */
+    updateEngineBadge(engine) {
+        const el = document.getElementById('watch-engine-badge');
+        if (!el) return;
+        el.textContent = engine;
+        el.classList.remove('hidden');
     }
 
     /**
@@ -696,6 +721,7 @@ class WatchPage {
      */
     playHlsJs(url) {
         this.clearNativeStallWatch();
+        this.updateEngineBadge('HLS.js');
         if (this.hls) {
             this.hls.destroy();
             this.hls = null;
@@ -757,12 +783,46 @@ class WatchPage {
         this._nativeStallUrl = url;
         let lastTime = -1;
         let stuckStreak = 0;
+        let hasStarted = false;
+        let neverStartedChecks = 0;
         this._nativeStallInterval = setInterval(() => {
             if (this._nativeStallUrl !== url) {
                 this.clearNativeStallWatch();
                 return;
             }
             if (this.video.paused || this.video.seeking) return;
+
+            if (!hasStarted) {
+                if (this.video.currentTime > 0) {
+                    hasStarted = true;
+                    lastTime = this.video.currentTime;
+                } else {
+                    // Still on the very first frame - this is normal startup
+                    // buffering, not a stall. A full software re-encode can
+                    // legitimately take close to the server's own 15s
+                    // session-start timeout before its first segment even
+                    // exists, so "hasn't started yet" gets a longer, separate
+                    // grace period before being treated as a stall itself -
+                    // otherwise this fires on ordinary slow-starting sessions
+                    // and silently loses native playback (and AirPlay video)
+                    // for exactly the content that most needs the time.
+                    neverStartedChecks++;
+                    if (neverStartedChecks >= 7) { // ~21s
+                        console.warn('[WatchPage] Native HLS never started, falling back to HLS.js:', url);
+                        this.clearNativeStallWatch();
+                        onStall();
+                    }
+                }
+                return;
+            }
+
+            // Reverted: a videoWidth-based check lived here briefly, meant to
+            // catch audio-only playback. Pulled after it broke Live TV,
+            // which was working before it was added - there's apparently a
+            // normal, brief window right after playback starts where
+            // videoWidth is legitimately still 0, and 9s wasn't a safe
+            // threshold to distinguish that from a genuine failure.
+
             if (this.video.currentTime === lastTime) {
                 stuckStreak++;
             } else {
@@ -1064,14 +1124,17 @@ class WatchPage {
 
     hideLoading() {
         this.loadingSpinner?.classList.remove('show');
-        // canplay fires once there's decodable data regardless of whether a
-        // play() call actually succeeded - if autoplay got silently rejected
-        // (e.g. iOS after the async delay of starting a transcode session),
-        // the video never actually transitions state, so neither 'play' nor
-        // 'pause' fires and onPause() (which is what shows the center play
-        // button) never runs. Checking directly here is the one place
-        // guaranteed to catch that and give the user a way to manually
-        // resume instead of a frozen, unrecoverable video.
+    }
+
+    // canplay fires once there's decodable data regardless of whether a
+    // play() call actually succeeded - if autoplay got silently rejected
+    // (e.g. iOS after the async delay of starting a transcode session), the
+    // video never actually transitions state, so neither 'play' nor 'pause'
+    // fires and onPause() (which is what shows the center play button) never
+    // runs. Checking directly here is the one place guaranteed to catch that
+    // and give the user a way to manually resume instead of a frozen,
+    // unrecoverable video.
+    checkStalledAutoplay() {
         if (this.video?.paused) this.onPause();
     }
 

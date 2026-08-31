@@ -553,7 +553,17 @@ class TranscodeSession extends EventEmitter {
             '-preset', 'veryfast',     // Fast for real-time
             '-crf', String(crf),
             '-profile:v', 'high',
-            '-level', '4.1',
+            // Level 4.1 caps the macroblock rate at 245,760 MB/s - plenty for
+            // 1080p30, but some live channels run 1080p50/60, which needs
+            // ~408,000 MB/s (confirmed directly: FFmpeg logs "MB rate (408000)
+            // > level limit (245760)" for one of these channels). Encoding at
+            // a level our own output doesn't actually comply with produces a
+            // stream that strict hardware decoders (iOS's included) can stutter
+            // or choke on - exactly the buffering this was silently causing.
+            // Level 5.1 covers 1080p up to high frame rates (and 4K30) and is
+            // supported by any modern decoder, so there's no compatibility
+            // trade-off for using the correct level instead of a fixed 4.1.
+            '-level', '5.1',
             '-pix_fmt', 'yuv420p'      // Force 8-bit output for compatibility (fixes 10-bit input errors)
         );
 

@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const fs = require('fs/promises');
+const fsSync = require('fs');
 const path = require('path');
 const db = require('../db');
 const auth = require('../auth');
@@ -107,13 +108,25 @@ router.get('/', async (req, res) => {
 
             if (r.status === 'recording') {
                 // Current size + planned stop time, so the UI can extrapolate an
-                // estimated final size while it's still in progress.
-                const stat = await fs.stat(filePath).catch(() => null);
+                // estimated final size while it's still in progress. While
+                // actively recording, the data lives in part files (see
+                // RecordingSession - a restart after a dropped connection
+                // writes a new part rather than resuming the final filename
+                // directly), which only get joined into r.filename once the
+                // recording actually stops - so the size has to be summed
+                // across whatever parts exist right now instead of stat-ing
+                // a file that doesn't exist yet.
                 const session = recordingSession.getSessionByDbId(r.id);
+                const parts = session?.parts?.length ? session.parts : [filePath];
+                let currentSizeBytes = null;
+                for (const partPath of parts) {
+                    const stat = await fs.stat(partPath).catch(() => null);
+                    if (stat) currentSizeBytes = (currentSizeBytes || 0) + stat.size;
+                }
                 return {
                     ...r,
                     fileExists: true,
-                    currentSizeBytes: stat ? stat.size : null,
+                    currentSizeBytes,
                     autoStopAt: session ? session.autoStopAt : null
                 };
             }
@@ -153,19 +166,124 @@ router.get('/:id/download', async (req, res) => {
     });
 });
 
+function isSessionActive(session) {
+    return session.status === 'starting' || session.status === 'recording';
+}
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 /**
- * Stream a recording for in-app playback (not a forced download) - Range
- * requests work via res.sendFile()'s built-in support, same as any other
- * static file Express serves, so seeking works and playback can start
- * before the whole file is fetched. Also what the server's own probe/remux
- * pipeline reads from when watching a recording through WatchPage, exactly
- * like it already does for a live channel's URL.
+ * Pipe filePath[start..end] to res. Resolves true if the response closed
+ * early (client disconnected or a read error), false on a clean finish.
+ */
+function pipeRange(filePath, start, end, res) {
+    return new Promise((resolve) => {
+        const stream = fsSync.createReadStream(filePath, { start, end });
+        let failed = false;
+        stream.on('data', (chunk) => {
+            if (!res.write(chunk)) stream.pause();
+        });
+        res.on('drain', () => stream.resume());
+        stream.on('end', () => resolve(failed));
+        stream.on('error', () => { failed = true; resolve(true); });
+    });
+}
+
+/**
+ * Stream a still-in-progress recording live: play the finished part files
+ * in order, tail the currently-active one as FFmpeg writes to it, and
+ * follow a mid-watch restart (see RecordingSession's part-file restart
+ * handling for why a recording can rotate to a new part at all) on to the
+ * next part it creates - all transparent to the client, which just sees one
+ * continuous response. No Range support - a recording that's still growing
+ * has nothing meaningful to seek to yet, so every request gets a fresh
+ * response starting from the beginning.
+ */
+async function streamActiveRecording(session, res) {
+    res.setHeader('Content-Type', 'video/mp2t');
+    res.setHeader('Cache-Control', 'no-store');
+    let closed = false;
+    res.on('close', () => { closed = true; });
+
+    let partIdx = 0;
+    let totalSent = 0;
+
+    while (!closed) {
+        const partPath = session.parts[partIdx];
+
+        if (!partPath) {
+            if (isSessionActive(session)) { await sleep(500); continue; }
+            break; // recording ended and this part never existed - nothing more coming
+        }
+
+        let offset = 0;
+        let advance = false;
+
+        while (!closed && !advance) {
+            const stat = await fs.stat(partPath).catch(() => null);
+
+            if (!stat) {
+                // Vanished mid-read - only expected once finalizeRecording()
+                // has joined every part into the final file. Pick up at the
+                // same cumulative offset there (a byte-for-byte
+                // concatenation of the parts in order), then stop - there's
+                // nothing beyond the final file either way.
+                if (isSessionActive(session)) { await sleep(500); continue; }
+                const finalStat = await fs.stat(session.filePath).catch(() => null);
+                if (finalStat && finalStat.size > totalSent) {
+                    if (await pipeRange(session.filePath, totalSent, finalStat.size - 1, res)) closed = true;
+                }
+                closed = true;
+                break;
+            }
+
+            if (stat.size > offset) {
+                if (await pipeRange(partPath, offset, stat.size - 1, res)) { closed = true; break; }
+                totalSent += stat.size - offset;
+                offset = stat.size;
+                continue; // recheck immediately - more may have arrived while sending
+            }
+
+            // Caught up to this part's current size - it's done growing once
+            // a later part exists (a restart moved on) or the session
+            // stopped entirely; otherwise FFmpeg is still writing it.
+            if (session.parts.length > partIdx + 1 || !isSessionActive(session)) {
+                advance = true;
+            } else {
+                await sleep(500);
+            }
+        }
+
+        partIdx++;
+    }
+
+    if (!closed) res.end();
+}
+
+/**
+ * Stream a recording for in-app playback (not a forced download). While
+ * still actively recording, the data lives in part files that only get
+ * joined into the final filename once the recording stops (see
+ * RecordingSession) - so an in-progress recording is served live via
+ * streamActiveRecording() instead of statting a file that doesn't exist yet.
+ * Once finished, Range requests work via res.sendFile()'s built-in support,
+ * same as any other static file Express serves, so seeking works and
+ * playback can start before the whole file is fetched. Also what the
+ * server's own probe/remux pipeline reads from when watching a recording
+ * through WatchPage, exactly like it already does for a live channel's URL.
  * GET /api/recordings/:id/stream
  */
 router.get('/:id/stream', async (req, res) => {
     const recording = await db.recordings.getById(req.params.id);
     if (!recording) {
         return res.status(404).json({ error: 'Recording not found' });
+    }
+
+    const session = recordingSession.getSessionByDbId(recording.id);
+    if (session) {
+        return streamActiveRecording(session, res);
     }
 
     const filePath = path.join(recordingSession.RECORDINGS_DIR, recording.filename);

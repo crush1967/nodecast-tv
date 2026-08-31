@@ -216,6 +216,14 @@ app.use((err, req, res, next) => {
 app.listen(PORT, async () => {
     console.log(`NodeCast TV server running on http://localhost:${PORT}`);
 
+    // Recover any recording left stuck mid-flight by a restart or crash
+    // before anything else touches recordings - see reconcileOrphanedRecordings()
+    // for why this is needed at all. Awaited (and run first) so the
+    // scheduler's own startup check right after never sees a stale
+    // 'recording' row it might otherwise race.
+    await require('./services/recordingSession').reconcileOrphanedRecordings()
+        .catch(err => console.error('[RecordingSession] Orphan reconcile failed:', err));
+
     // Start the scheduled-recording checker immediately, independent of the
     // (potentially slow) EPG sync below - a schedule due right now shouldn't
     // have to wait on that.

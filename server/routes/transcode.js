@@ -47,6 +47,28 @@ router.post('/session', async (req, res) => {
     // the caller just asked for.
     const resolutionOverridden = maxResolution !== undefined;
 
+    // Guard against duplicate concurrent sessions for the same live channel.
+    // The client is supposed to stop its old session before starting a new
+    // one, but that tracking can get out of sync - e.g. iOS suspending a
+    // page in the background without giving it a chance to run cleanup, then
+    // the client resuming and starting fresh without realizing the old
+    // session never actually stopped server-side. Two sessions pulling the
+    // same channel then fight each other for this provider's one-connection
+    // limit, which looks exactly like "buffers forever." Live channels only
+    // ever have one legitimate viewer session at a time (unlike VOD, where
+    // different seek points for the same title are normal), so for those,
+    // stop any existing session on this exact URL before creating a new one
+    // - a server-side backstop that holds regardless of why the client's own
+    // tracking got confused.
+    if (sessionType === 'live') {
+        const duplicates = transcodeSession.getAllSessions()
+            .filter(s => s.url === url && s.status === 'running');
+        for (const dup of duplicates) {
+            console.log(`[Transcode] Stopping duplicate live session ${dup.id} for ${url} before starting a new one`);
+            await transcodeSession.removeSession(dup.id);
+        }
+    }
+
     try {
         const session = await transcodeSession.createSession(url, {
             ffmpegPath,
