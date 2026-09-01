@@ -805,6 +805,11 @@ class ChannelList {
 
         this.groups = this.groups.concat(categoryGroups);
 
+        // O(1) category name lookup - a linear find() per stream turns into
+        // O(streams x categories) on large playlists (15k+ channels), which
+        // is slow enough to look like the UI has hung.
+        const categoryNameById = new Map(categories.map(c => [String(c.category_id), c.category_name]));
+
         // Map streams to channels
         const channelList = streams.map(stream => ({
             id: `xtream_${sourceId}_${stream.stream_id}`,
@@ -813,8 +818,7 @@ class ChannelList {
             tvgId: stream.epg_channel_id,
             tvgLogo: stream.stream_icon,
             groupId: `xtream_${sourceId}_${stream.category_id}`,
-            // Use string comparison to handle type mismatches (number vs string category_id)
-            groupTitle: categories.find(c => String(c.category_id) === String(stream.category_id))?.category_name || 'Uncategorized',
+            groupTitle: categoryNameById.get(String(stream.category_id)) || 'Uncategorized',
             sourceId,
             sourceType: 'xtream'
         }));

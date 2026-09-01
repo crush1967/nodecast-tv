@@ -85,25 +85,48 @@ class App {
         }
 
         // Desktop sidebar collapse toggle
-        const sidebarCollapseBtn = document.getElementById('sidebar-collapse-btn');
-        const sidebarExpandBtn = document.getElementById('sidebar-expand-btn');
         const homeLayout = document.querySelector('.home-layout');
 
-        const toggleSidebarCollapse = () => {
-            channelSidebar?.classList.toggle('collapsed');
-            homeLayout?.classList.toggle('sidebar-collapsed');
+        const sidebarExpandBtn = document.getElementById('sidebar-expand-btn');
 
-            // Persist preference
-            const isCollapsed = channelSidebar?.classList.contains('collapsed');
-            localStorage.setItem('sidebarCollapsed', isCollapsed ? 'true' : 'false');
+        const toggleSidebarCollapse = () => {
+            // The sidebar and its expand button are now mutually-exclusive
+            // display:none/flex toggles - no width tricks, no opacity/
+            // pointer-events, no absolute positioning. Whichever one is
+            // showing occupies real space in .home-layout's flex row, so
+            // there's nothing left for another element to overlap it with.
+            const willCollapse = channelSidebar?.style.display !== 'none';
+            if (channelSidebar) {
+                channelSidebar.style.display = willCollapse ? 'none' : '';
+            }
+            if (sidebarExpandBtn) {
+                sidebarExpandBtn.style.display = willCollapse ? 'flex' : 'none';
+            }
+            homeLayout?.classList.toggle('sidebar-collapsed', willCollapse);
+            localStorage.setItem('sidebarCollapsed', willCollapse ? 'true' : 'false');
         };
 
-        sidebarCollapseBtn?.addEventListener('click', toggleSidebarCollapse);
-        sidebarExpandBtn?.addEventListener('click', toggleSidebarCollapse);
+        // Delegated on document rather than bound to the two buttons directly -
+        // this only needs document.body to exist (true from the moment this
+        // script runs), so it can't silently no-op the way a direct
+        // getElementById().addEventListener() would if this code ever ran
+        // before those specific nodes were in the DOM.
+        document.addEventListener('click', (e) => {
+            if (e.target.closest('#sidebar-collapse-btn, #sidebar-expand-btn')) {
+                toggleSidebarCollapse();
+            }
+        });
 
-        // Restore sidebar state from localStorage
+        // Restore sidebar state from localStorage - must set the same
+        // display values toggleSidebarCollapse() sets, so the first click
+        // reads the correct current state from channelSidebar.style.display.
         if (localStorage.getItem('sidebarCollapsed') === 'true') {
-            channelSidebar?.classList.add('collapsed');
+            if (channelSidebar) {
+                channelSidebar.style.display = 'none';
+            }
+            if (sidebarExpandBtn) {
+                sidebarExpandBtn.style.display = 'flex';
+            }
             homeLayout?.classList.add('sidebar-collapsed');
         }
 

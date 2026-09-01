@@ -109,8 +109,8 @@ function getStreamsFromDb(sourceId, type, categoryId = null, includeHidden = fal
             stream_id: item.item_id, // ensure ID matches what client expects
             series_id: type === 'series' ? item.item_id : undefined,
             name: item.name,
-            stream_icon: item.stream_icon,
-            cover: item.stream_icon, // series/vod often use cover
+            stream_icon: item.stream_icon || data.cover,
+            cover: data.cover || item.stream_icon, // series/vod often use cover
             added: item.added_at,
             rating: item.rating,
             container_extension: item.container_extension,

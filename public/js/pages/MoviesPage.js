@@ -278,7 +278,8 @@ class MoviesPage {
             card.dataset.movieId = movie.stream_id;
             card.dataset.sourceId = movie.sourceId;
 
-            const poster = movie.stream_icon || movie.cover || '/img/placeholder.png';
+            const rawPoster = movie.stream_icon || movie.cover;
+            const poster = rawPoster ? `/api/proxy/image?url=${encodeURIComponent(rawPoster)}` : '/img/placeholder.png';
             const year = movie.year || movie.releaseDate?.substring(0, 4) || '';
             const rating = movie.rating ? `${Icons.star} ${movie.rating}` : '';
 

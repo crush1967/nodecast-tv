@@ -407,6 +407,7 @@ h4 {
 /* Sidebar */
 .channel-sidebar {
   width: var(--sidebar-width);
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
   background: var(--color-bg-secondary);
@@ -455,37 +456,28 @@ h4 {
    button on mobile appear to do nothing. */
 @media (min-width: 769px) {
   .channel-sidebar.collapsed {
-    width: 0;
-    min-width: 0;
-    overflow: hidden;
-    border-right: none;
-  }
-
-  .channel-sidebar.collapsed .sidebar-header,
-  .channel-sidebar.collapsed .channel-list {
-    opacity: 0;
-    visibility: hidden;
+    display: none;
   }
 }
 
-/* Expand button when sidebar is collapsed */
+/* Expand button when sidebar is collapsed - a normal flex item taking its
+   own dedicated space in .home-layout's layout flow, not absolutely
+   positioned on top of other content. This deliberately avoids any
+   z-index/stacking-context dependency: nothing else occupies this box, so
+   nothing else can end up covering it or intercepting clicks meant for it. */
 .sidebar-expand-btn {
   display: none;
-  position: absolute;
-  left: 0;
-  top: calc(var(--navbar-height) + var(--space-md));
-  z-index: 50;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  flex-shrink: 0;
+  align-self: stretch;
   background: var(--glass-bg);
-  backdrop-filter: blur(12px);
   border: 1px solid var(--glass-border);
-  border-left: none;
-  border-radius: 0 var(--radius-md) var(--radius-md) 0;
-  padding: var(--space-sm);
+  border-radius: var(--radius-md);
   cursor: pointer;
   color: var(--color-text-primary);
-  transition: opacity 0.3s ease, background var(--transition-fast);
-  opacity: 0;
-  pointer-events: none;
+  transition: background var(--transition-fast);
 }
 
 .sidebar-expand-btn:hover {
@@ -495,17 +487,6 @@ h4 {
 .sidebar-expand-btn .icon {
   width: 20px;
   height: 20px;
-}
-
-/* Show expand button when sidebar is collapsed */
-.home-layout.sidebar-collapsed .sidebar-expand-btn {
-  display: flex;
-}
-
-/* Fade in expand button with player controls */
-.home-layout.sidebar-collapsed .sidebar-expand-btn.visible {
-  opacity: 1;
-  pointer-events: auto;
 }
 
 /* Hide expand button on mobile - mobile uses the floating toggle instead */
@@ -2314,15 +2295,17 @@ kbd {
     display: flex;
   }
 
-  /* Mobile dropdown menu */
+  /* Mobile dropdown menu - solid background, not the translucent "glass"
+     effect used elsewhere: this covers the full page content behind it, and
+     backdrop-filter blur doesn't render on every mobile browser, which left
+     it see-through with no blur to compensate on some phones. */
   .navbar-menu {
     position: fixed;
     top: var(--navbar-height);
     left: 0;
     right: 0;
     flex-direction: column;
-    background: var(--glass-bg);
-    backdrop-filter: blur(12px);
+    background: var(--color-bg-secondary);
     border-bottom: 1px solid var(--glass-border);
     padding: 0;
     gap: 0;

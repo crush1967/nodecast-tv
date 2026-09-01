@@ -3,6 +3,7 @@ require('dotenv').config();
 const path = require('path');
 const https = require('https');
 const passport = require('passport');
+const compression = require('compression');
 const syncService = require('./services/syncService');
 
 // Initialize database
@@ -17,6 +18,7 @@ const HTTPS_PORT = process.env.HTTPS_PORT || 3443;
 app.set('trust proxy', true);
 
 // Middleware
+app.use(compression());
 app.use(express.json({ limit: '50mb' }));
 
 // Initialize Passport

@@ -24,7 +24,25 @@ const API = {
             options.body = JSON.stringify(data);
         }
 
-        const response = await fetch(`/api${endpoint}`, options);
+        // Without a timeout, a stalled connection (seen especially over
+        // Tailscale/remote access) leaves the fetch promise pending forever -
+        // callers just show a spinner with no way to know it's actually
+        // dead. Aborting after 30s turns that into a normal error so the
+        // existing error/retry UI in each caller kicks in.
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+        let response;
+        try {
+            response = await fetch(`/api${endpoint}`, { ...options, signal: controller.signal });
+        } catch (err) {
+            if (err.name === 'AbortError') {
+                throw new Error('Request timed out - the server took too long to respond');
+            }
+            throw err;
+        } finally {
+            clearTimeout(timeoutId);
+        }
 
         let result;
         const contentType = response.headers.get('content-type');

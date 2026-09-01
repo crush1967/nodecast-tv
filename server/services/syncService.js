@@ -298,7 +298,7 @@ class SyncService {
                     itemId = item.stream_id;
                     name = item.name || `Movie ${item.stream_id}`;
                     catId = item.category_id;
-                    icon = item.stream_icon; // or cover
+                    icon = item.stream_icon || item.cover;
                     container = item.container_extension;
                     rating = item.rating;
                     added = item.added;
