@@ -89,7 +89,17 @@ class App {
 
         const sidebarExpandBtn = document.getElementById('sidebar-expand-btn');
 
+        // Desktop-only feature. Below 768px #channel-sidebar is repurposed as
+        // a slide-out drawer toggled by .active - setting an inline
+        // style.display here would beat that drawer's transform/.active CSS
+        // outright (inline styles win over any class, media-query-scoped or
+        // not), leaving the drawer permanently stuck closed on mobile once a
+        // collapse preference from a desktop visit lands in localStorage.
+        const isDesktopViewport = () => window.matchMedia('(min-width: 769px)').matches;
+
         const toggleSidebarCollapse = () => {
+            if (!isDesktopViewport()) return;
+
             // The sidebar and its expand button are now mutually-exclusive
             // display:none/flex toggles - no width tricks, no opacity/
             // pointer-events, no absolute positioning. Whichever one is
@@ -120,7 +130,8 @@ class App {
         // Restore sidebar state from localStorage - must set the same
         // display values toggleSidebarCollapse() sets, so the first click
         // reads the correct current state from channelSidebar.style.display.
-        if (localStorage.getItem('sidebarCollapsed') === 'true') {
+        // Desktop-only, same reasoning as toggleSidebarCollapse() above.
+        if (isDesktopViewport() && localStorage.getItem('sidebarCollapsed') === 'true') {
             if (channelSidebar) {
                 channelSidebar.style.display = 'none';
             }
