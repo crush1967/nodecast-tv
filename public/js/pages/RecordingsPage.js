@@ -230,6 +230,32 @@ class RecordingsPage {
         });
     }
 
+    /** Copy an external-player-friendly HLS link (see api.js's getHlsUrl) to
+     * the clipboard - separate from the Watch button's own player, which
+     * already handles the remux itself and doesn't need this URL. */
+    wireCopyLinkButtons(root) {
+        root.querySelectorAll('.btn-copy-link').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const url = API.recordings.getHlsUrl(btn.dataset.id);
+                const originalText = btn.textContent;
+                const showCopied = () => {
+                    btn.textContent = 'Copied!';
+                    setTimeout(() => { btn.textContent = originalText; }, 1500);
+                };
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    try {
+                        await navigator.clipboard.writeText(url);
+                        showCopied();
+                        return;
+                    } catch (err) {
+                        // Fall through to the prompt fallback below.
+                    }
+                }
+                prompt('Copy this URL:', url);
+            });
+        });
+    }
+
     wireExtendButtons(root) {
         root.querySelectorAll('.btn-extend').forEach(btn => {
             btn.addEventListener('click', async () => {
@@ -382,6 +408,7 @@ class RecordingsPage {
                 actionsHtml: `
                     ${!isError && !isMissing ? `<button class="btn-primary btn-watch-recording" data-id="${r.id}" data-channel="${this.escapeHtml(r.channelName || '')}" data-started="${r.startedAt}">Watch</button>` : ''}
                     ${!isError && !isMissing ? `<a class="btn-secondary" href="${API.recordings.getDownloadUrl(r.id)}">Download</a>` : ''}
+                    ${!isError && !isMissing ? `<button class="btn-secondary btn-copy-link" data-id="${r.id}">Copy Link</button>` : ''}
                     <button class="btn-danger btn-delete-recording" data-id="${r.id}">${isMissing ? 'Remove' : 'Delete'}</button>
                 `
             });
@@ -393,6 +420,7 @@ class RecordingsPage {
         `;
 
         this.wireWatchButtons(section);
+        this.wireCopyLinkButtons(section);
 
         section.querySelectorAll('.btn-delete-recording').forEach(btn => {
             btn.addEventListener('click', async () => {
