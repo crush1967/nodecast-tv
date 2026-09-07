@@ -3,12 +3,10 @@ const router = express.Router();
 const fs = require('fs/promises');
 const fsSync = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
 const db = require('../db');
 const auth = require('../auth');
 const recordingSession = require('../services/recordingSession');
 const diskGuard = require('../services/diskGuard');
-const transcodeSession = require('../services/transcodeSession');
 
 /**
  * Recording Routes
@@ -295,97 +293,6 @@ router.get('/:id/stream', async (req, res) => {
             res.status(404).json({ error: 'Recording file not found' });
         }
     });
-});
-
-/**
- * Quick ffprobe of just the video codec, so the HLS export below can pick
- * the right bitstream filter (see TranscodeSession.buildFFmpegArgs's 'copy'
- * branch) instead of guessing. Best-effort - callers fall back to 'unknown'
- * (which still works, just via a generic bitstream filter) rather than
- * failing the whole export over a probe hiccup.
- */
-function probeVideoCodec(filePath, ffprobePath) {
-    return new Promise((resolve, reject) => {
-        const proc = spawn(ffprobePath, [
-            '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=codec_name',
-            '-of', 'csv=p=0',
-            filePath
-        ]);
-        let stdout = '';
-        proc.stdout.on('data', (d) => { stdout += d; });
-        proc.on('close', (code) => {
-            if (code !== 0) return reject(new Error(`ffprobe exited with code ${code}`));
-            resolve(stdout.trim().toLowerCase() || 'unknown');
-        });
-        proc.on('error', reject);
-    });
-}
-
-/**
- * Serve a completed recording as an externally-consumable HLS playlist -
- * for pasting into a separate player app (a different IPTV client, VLC,
- * etc.) that hits this URL directly rather than going through NodeCast TV's
- * own Watch page. The raw file (served by /:id/stream and /:id/download) is
- * unprocessed MPEG-TS with no container-level duration index, joined
- * byte-for-byte from however many part files the recording produced - fine
- * for our own player once routed through the same stream-copy remux this
- * route uses (see WatchPage.js's recording-playback handling), but an
- * external player hitting the raw file directly gets none of that and hits
- * the exact same "stops partway / can't seek past a wrong duration" problem.
- * This lazily starts (or reuses) a stream-copy VOD transcode session against
- * the finished file and redirects to its playlist, so any external player
- * gets a real HLS .m3u8 instead.
- * GET /api/recordings/:id/hls.m3u8
- */
-router.get('/:id/hls.m3u8', async (req, res) => {
-    const recording = await db.recordings.getById(req.params.id);
-    if (!recording) {
-        return res.status(404).json({ error: 'Recording not found' });
-    }
-    if (recording.status === 'recording') {
-        return res.status(409).json({ error: 'Recording is still in progress - the external link is only available once it finishes.' });
-    }
-
-    const filePath = path.join(recordingSession.RECORDINGS_DIR, recording.filename);
-    const fileExists = await fs.access(filePath).then(() => true).catch(() => false);
-    if (!fileExists) {
-        return res.status(404).json({ error: 'Recording file not found' });
-    }
-
-    const ffmpegPath = req.app.locals.ffmpegPath || 'ffmpeg';
-    const ffprobePath = req.app.locals.ffprobePath;
-    const settings = await db.settings.get();
-    const userAgent = db.getUserAgent(settings);
-
-    const videoCodec = ffprobePath
-        ? await probeVideoCodec(filePath, ffprobePath).catch(() => 'unknown')
-        : 'unknown';
-
-    try {
-        // Keyed by filePath (stable across requests for this recording) so a
-        // second player re-hitting this same link mid-playback reuses the
-        // already-running session instead of spawning a duplicate FFmpeg
-        // process against the same file.
-        const session = await transcodeSession.getOrCreateSession(filePath, {
-            ffmpegPath,
-            userAgent,
-            videoMode: 'copy',
-            sessionType: 'vod',
-            videoCodec
-        });
-        await session.start(); // no-op if getOrCreateSession returned an already-running session
-
-        const ready = await session.waitForPlaylist(15000);
-        if (!ready) {
-            return res.status(500).json({ error: 'Failed to prepare HLS playlist for this recording' });
-        }
-        res.redirect(`/api/transcode/${session.id}/stream.m3u8`);
-    } catch (err) {
-        console.error(`[Recordings] Failed to prepare HLS export for recording ${recording.id}:`, err);
-        res.status(500).json({ error: 'Failed to prepare HLS playlist', details: err.message });
-    }
 });
 
 /**

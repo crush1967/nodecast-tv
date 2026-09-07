@@ -92,14 +92,7 @@ const API = {
         // Plain URL (not fetch) so the browser handles the file save; token is passed
         // as a query param since a normal <a href> navigation carries no Authorization header
         getDownloadUrl: (id) => `/api/recordings/${id}/download?token=${encodeURIComponent(localStorage.getItem('authToken') || '')}`,
-        getStreamUrl: (id) => `${window.location.origin}/api/recordings/${id}/stream?token=${encodeURIComponent(localStorage.getItem('authToken') || '')}`,
-        // For pasting into a separate player app (not our own Watch page,
-        // which already routes recordings through a remux session itself -
-        // see WatchPage.js). Points at an HLS playlist instead of the raw
-        // .ts file, so an external player gets a real duration and working
-        // seek instead of the same "stops partway through" problem the raw
-        // stream/download URLs have outside our own player.
-        getHlsUrl: (id) => `${window.location.origin}/api/recordings/${id}/hls.m3u8?token=${encodeURIComponent(localStorage.getItem('authToken') || '')}`
+        getStreamUrl: (id) => `${window.location.origin}/api/recordings/${id}/stream?token=${encodeURIComponent(localStorage.getItem('authToken') || '')}`
     },
 
     // Scheduled Recordings
