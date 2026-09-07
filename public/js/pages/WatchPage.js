@@ -474,6 +474,57 @@ class WatchPage {
             console.warn('Could not load settings');
         }
 
+        // A recording is always raw MPEG-TS with no container-level duration
+        // index, joined byte-for-byte from however many part files the
+        // recording produced (RecordingSession restarts and writes a new part
+        // whenever the provider connection drops mid-recording, rather than
+        // stopping the recording early). Playing that directly via `<video
+        // src>` - which every OTHER stream type on this page probes to avoid
+        // - only ever "worked" by accident: without a real index, the
+        // duration/seek range native playback reports gets fixed from an
+        // early partial read and never corrected, so playback stalls well
+        // before the file's actual end (exactly at a part boundary if the
+        // recording restarted), skip-forward is capped at that same wrong
+        // point, and the progress bar/time never reflect real position.
+        // Routing through the same stream-copy HLS remux session used below
+        // for "needsRemux" VOD content sidesteps all of that - HLS.js reports
+        // a real duration from the segment list (also re-timestamping across
+        // any part-restart discontinuity as it remuxes), and seeking becomes
+        // a normal playlist seek instead of guessing inside one opaque file.
+        if (this.contentType === 'recording') {
+            let videoCodec = 'unknown', audioCodec = '', audioChannels = 0;
+            try {
+                const probeRes = await fetch(`/api/probe?url=${encodeURIComponent(url)}`);
+                const info = await probeRes.json();
+                videoCodec = info.video;
+                audioCodec = info.audio;
+                audioChannels = info.audioChannels;
+            } catch (e) {
+                console.warn('[WatchPage] Recording probe failed, assuming h264:', e.message);
+            }
+
+            this.updateTranscodeStatus('remuxing', 'Preparing Recording');
+            try {
+                const playlistUrl = await this.startTranscodeSession(url, {
+                    videoMode: 'copy',
+                    sessionType: 'vod',
+                    videoCodec,
+                    audioCodec,
+                    audioChannels
+                });
+                this.playHls(playlistUrl);
+            } catch (err) {
+                console.error('[WatchPage] Recording remux session failed, falling back to direct playback:', err);
+                this.updateTranscodeStatus('direct', 'Direct Play');
+                this.video.src = url;
+                this.video.play().catch(e => {
+                    if (e.name !== 'AbortError') console.error('[WatchPage] Autoplay error:', e);
+                });
+            }
+            this.setVolumeFromStorage();
+            return;
+        }
+
         // Detect stream type
         const looksLikeHls = url.includes('.m3u8') || url.includes('m3u8');
         const isRawTs = url.includes('.ts') && !url.includes('.m3u8');
@@ -1007,11 +1058,16 @@ class WatchPage {
     // === UI Updates ===
 
     updateProgress() {
-        if (!this.video || !this.video.duration) return;
+        // isFinite, not just truthy - a raw/live-ish source with no real
+        // duration index reports Infinity here (truthy, so the old check let
+        // it through), which made percent always compute to 0 and left the
+        // progress bar permanently stuck instead of just not updating.
+        if (!this.video || !isFinite(this.video.duration) || this.video.duration <= 0) return;
 
         const percent = (this.video.currentTime / this.video.duration) * 100;
         this.progressSlider.value = percent;
         this.timeCurrent.textContent = this.formatTime(this.video.currentTime);
+        if (this.timeTotal) this.timeTotal.textContent = this.formatTime(this.video.duration);
 
         // Show "Up Next" panel early for series (like streaming services do during credits)
         // Only show if auto-play next episode is enabled
@@ -1044,6 +1100,13 @@ class WatchPage {
                 height: this.video.videoHeight
             };
             this.updateQualityBadge();
+        }
+
+        // Show total duration as soon as it's known, rather than waiting for
+        // the first timeupdate tick (updateProgress sets this too, but only
+        // once playback actually starts advancing).
+        if (this.timeTotal && this.video && isFinite(this.video.duration) && this.video.duration > 0) {
+            this.timeTotal.textContent = this.formatTime(this.video.duration);
         }
 
         // Handle resumption
