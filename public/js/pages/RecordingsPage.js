@@ -114,7 +114,7 @@ class RecordingsPage {
 
         container.innerHTML = `
             <div class="recordings-header">
-                <h2>Recordings</h2>
+                <h2>Recordings <span id="recordings-version" style="font-size:0.6em;opacity:0.5;font-weight:normal;"></span></h2>
             </div>
 
             <section class="schedule-panel">
@@ -158,6 +158,14 @@ class RecordingsPage {
         `;
 
         this.wireScheduleForm();
+
+        // Visible on-page version marker, so reloading this exact page is
+        // enough to confirm which build is actually running - no separate
+        // URL to visit or dev tools needed.
+        API.request('GET', '/version').then(v => {
+            const el = document.getElementById('recordings-version');
+            if (el && v?.version) el.textContent = `v${v.version}`;
+        }).catch(() => {});
     }
 
     async loadLists() {
