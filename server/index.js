@@ -198,6 +198,9 @@ app.use('/api/history', require('./routes/history'));
 app.use('/api/recordings', require('./routes/recordings'));
 app.use('/api/schedules', require('./routes/schedules'));
 
+// Xtream-compatible endpoints so other player apps can list/play recordings
+app.use('/', require('./routes/xtreamServer'));
+
 // Version endpoint
 app.get('/api/version', (req, res) => {
     const pkg = require('../package.json');
