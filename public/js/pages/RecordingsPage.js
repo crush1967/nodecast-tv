@@ -372,6 +372,13 @@ class RecordingsPage {
             return;
         }
 
+        // Same numbering as the Xtream list: playable recordings, oldest = 1
+        const numbers = new Map();
+        recordings
+            .filter(r => r.status !== 'error' && r.fileExists !== false)
+            .sort((a, b) => new Date(a.startedAt) - new Date(b.startedAt))
+            .forEach((r, i) => numbers.set(r.id, i + 1));
+
         const rows = recordings.map(r => {
             const isError = r.status === 'error';
             const isMissing = r.fileExists === false;
@@ -380,7 +387,9 @@ class RecordingsPage {
 
             return this.buildRow({
                 id: r.id,
-                channelName: r.channelName,
+                channelName: numbers.has(r.id)
+                    ? `#${String(numbers.get(r.id)).padStart(3, '0')} - ${r.channelName || 'Unknown Channel'}`
+                    : r.channelName,
                 metaHtml: `
                     <span class="recording-status ${statusClass}">${statusLabel}</span>
                     <span>${new Date(r.startedAt).toLocaleString()}</span>

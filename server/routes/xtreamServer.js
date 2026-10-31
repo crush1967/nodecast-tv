@@ -50,7 +50,8 @@ function recordingTitle(r) {
     const started = new Date(r.startedAt);
     const date = started.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
     const time = started.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-    return `${r.channelName || 'Recording'} - ${date} ${time}`;
+    const num = r.number ? `#${String(r.number).padStart(3, '0')} - ` : '';
+    return `${num}${r.channelName || 'Recording'} - ${date} ${time}`;
 }
 
 // Finished recordings whose file is still on disk, newest first
@@ -62,9 +63,14 @@ async function getPlayableRecordings() {
         const exists = await fs.access(filePath).then(() => true).catch(() => false);
         return exists ? r : null;
     }));
-    return withFile
+    const chronological = withFile
         .filter(Boolean)
-        .sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt));
+        .sort((a, b) => new Date(a.startedAt) - new Date(b.startedAt));
+    // Number oldest = 1 so a recording keeps its number as new ones are added
+    // (must match the numbering on the Recordings page).
+    return chronological
+        .map((r, i) => ({ ...r, number: i + 1 }))
+        .reverse();
 }
 
 function toVodStream(r, index) {
